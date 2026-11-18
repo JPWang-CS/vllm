@@ -1,0 +1,7 @@
+schema_version: 1
+name: pangu-92b
+family: pangu
+purpose: 多卡部署、模型性能和专家通信分析
+weights: 由本机配置指定只读目录
+platforms: [a3, a5]
+baseline_index: baselines/index.yaml

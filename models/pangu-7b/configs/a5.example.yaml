@@ -1,0 +1,36 @@
+schema_version: 1
+model: pangu-7b
+platform: a5
+devices: [0]
+identity:
+  device_model: Ascend 950DT
+  weights: ${MODEL_PATH}
+  dtype: bfloat16
+  quantization: none
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  pipeline_parallel_size: 1
+  vllm_version: ${VLLM_VERSION}
+  platform_plugin_version: ${PLATFORM_PLUGIN_VERSION}
+  cann_version: ${CANN_VERSION}
+env: {}
+changes: []
+service:
+  argv: ["${MODEL_PYTHON}", "-m", "vllm.entrypoints.openai.api_server", "--model", "${MODEL_PATH}", "--served-model-name", "pangu", "--trust-remote-code", "--host", "127.0.0.1", "--port", "18322", "--dtype", "bfloat16", "--tensor-parallel-size", "1", "--max-model-len", "16384", "--max-num-seqs", "4", "--enforce-eager", "--seed", "0"]
+  base_url: http://127.0.0.1:18322/v1
+  served_model: pangu
+  ready_timeout: 1800
+  request_timeout: 180
+  shutdown_timeout: 20
+evaluation:
+  dataset: ${EVAL_DATASET}
+  scope: RULER niah_single_1 + vt, fixed two-task subset
+  metric: ruler_official
+  official_metrics: ${RULER_METRICS}
+  context_limit: 16384
+  seed: 42
+  temperature: 0
+  top_p: 1
+  chat_template_kwargs: {thinking: false}
+  add_special_tokens: false
+  minimum_score: null

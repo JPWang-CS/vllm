@@ -1,0 +1,9 @@
+schema_version: 1
+platforms: [a3, a5]
+requires: []
+conflicts: []
+scope: 填写目标算子、dtype、shape和原生回退条件
+env:
+  ASCEND_CUSTOM_OPP_PATH: ${CUSTOM_OPP_PATH}
+# The project adapter must invoke the target operator and emit loaded path/dispatch evidence.
+verify_argv: ["${MODEL_PYTHON}", "${OP_VERIFY_SCRIPT}", "--output", "${RUN}/logs/op-verification.json"]

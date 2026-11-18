@@ -1,0 +1,5 @@
+schema_version: 1
+name: workflow-fixture
+family: http-fixture
+platforms: [cpu-test]
+purpose: 无模型计算的固定流程测试

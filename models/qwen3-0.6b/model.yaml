@@ -1,0 +1,11 @@
+schema_version: 1
+name: qwen3-0.6b
+family: qwen3
+purpose: 公开模型下载与首次整网运行示例
+platforms: [a3, a5]
+download:
+  provider: huggingface
+  repo_id: Qwen/Qwen3-0.6B
+  revision: main
+  token_env: HF_TOKEN
+  ignore_patterns: ["*.gguf", "*.onnx", "*.h5", "*.msgpack"]

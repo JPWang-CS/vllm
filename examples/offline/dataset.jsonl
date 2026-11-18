@@ -1,0 +1,2 @@
+{"id":"workflow/0","prompt":"hello","outputs":["hello"],"actual_chat_tokens":1,"output_tokens":8}
+{"id":"workflow/1","prompt":"world","outputs":["world"],"actual_chat_tokens":1,"output_tokens":8}
