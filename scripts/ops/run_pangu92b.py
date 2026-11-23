@@ -4,7 +4,7 @@ from pathlib import Path
 from fullnet.analysis import report
 from fullnet.execution import plan,run_experiment
 from fullnet.export import export_run
-from fullnet.measurements import collect_performance,collect_profile
+from fullnet.measurements import collect_performance,collect_profile,pd_mixed_probe,pd_split_probe
 from fullnet.store import read_json,rows,write_json
 
 
@@ -37,6 +37,7 @@ def main():
     p.add_argument('--devices',type=int,nargs='+',required=True);p.add_argument('--npu-ids',type=int,nargs='+',required=True)
     p.add_argument('--tp',type=int,default=2);p.add_argument('--dp',type=int,default=1);p.add_argument('--pp',type=int,default=1)
     p.add_argument('--graph',choices=('eager','full_decode_only'),default='eager');p.add_argument('--mtp',type=int,choices=(0,3),default=0)
+    p.add_argument('--pd-mode',choices=('','mixed','split'),default='')
     p.add_argument('--task',required=True);p.add_argument('--port',type=int,default=18322)
     p.add_argument('--dataset',type=Path);p.add_argument('--keep-ready',action='store_true')
     p.add_argument('--quality-only',action='store_true');p.add_argument('--requests',type=int,default=32)
@@ -46,7 +47,9 @@ def main():
     aligned.add_argument('--disable-aligned-decode',action='store_true')
     aligned.add_argument('--enable-aligned-decode',action='store_true')
     a=p.parse_args();root=a.project.resolve(strict=True);task=(root/'runs'/a.task).resolve(strict=True)
-    if not task.is_relative_to(root) or len(a.devices)!=a.tp*a.dp*a.pp or len(a.npu_ids)!=len(a.devices):raise ValueError('project or worker count mismatch')
+    split=a.pd_mode=='split'
+    workers_needed=a.tp*a.dp*a.pp*(2 if split else 1)
+    if not task.is_relative_to(root) or len(a.devices)!=workers_needed or len(a.npu_ids)!=len(a.devices):raise ValueError('project or worker count mismatch')
     if a.max_batched_tokens<1 or a.max_seqs<1:raise ValueError('max batched tokens and max seqs must be positive')
     ref=read_json(a.reference);b=ref['bootstrap'];python=b['python'];weights=a.weights.resolve(strict=True)
     hf=read_json(weights/'config.json')
@@ -89,8 +92,8 @@ def main():
         with (task/(label+'.log')).open('w') as log:r=subprocess.run(args,cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=timeout)
         write_json(task/(label+'-exit.json'),{'argv':args,'exit':r.returncode})
         if r.returncode:raise RuntimeError(label+' failed')
-    status={'model':'pangu-92b','model_requests':'not_run','profile':'not_run','stage':'device-pre',
-            'max_batched_tokens':a.max_batched_tokens,'max_seqs':a.max_seqs,
+    status={'model':'pangu-92b','model_requests':'not_run','profile':'not_run','stage':'device-pre','pd_mode':a.pd_mode or 'off',
+            'pd_mixed_probe':'not_run','max_batched_tokens':a.max_batched_tokens,'max_seqs':a.max_seqs,
             'aligned_decode':aligned_decode_effective,'aligned_decode_env':aligned_decode_env}
     run=None;owns_run=False;exit_code=0;failure=None
     try:
@@ -115,6 +118,19 @@ def main():
         if a.graph=='eager':args+=['--enforce-eager']
         else:args+=['--compilation-config',json.dumps({'level':3,'backend':'eager','cudagraph_mode':'FULL_DECODE_ONLY','cudagraph_capture_sizes':[32]})]
         if a.mtp:args+=['--speculative-config',json.dumps({'method':'mtp','num_speculative_tokens':a.mtp})]
+        if split:
+            producer_devices=','.join(map(str,a.devices[:a.tp*a.dp]));consumer_devices=','.join(map(str,a.devices[a.tp*a.dp:]))
+            args=[python,'-B',str(root/'models/pangu-92b/adapters/serve_pd_split.py'),
+                '--serve-adapter',str(root/'models/pangu-92b/adapters/serve.py'),'--model',str(weights),
+                '--proxy-script',str(root/'models/pangu-92b/adapters/pd_relay_proxy.py'),
+                '--producer-devices',producer_devices,'--consumer-devices',consumer_devices,
+                '--producer-port',str(a.port+1),'--consumer-port',str(a.port+2),
+                '--proxy-port',str(a.port+3),'--front-port',str(a.port),
+                '--kv-port-base','7100','--gpu-share','0.8','--ready-timeout','3600',
+                '--max-batched-tokens',str(a.max_batched_tokens),'--max-seqs',str(a.max_seqs),
+                # pd_split_probe reads pd-split-<role>.log from the experiment
+                # run dir; plan() creates this directory before the service starts.
+                '--logs',str(root/'models/pangu-92b/experiments'/a.task/'logs')]
         target=root/'models/pangu-92b/experiments'/a.task
         env.update(VLLM_TORCH_PROFILER_DIR=str(target/'profiles'),VLLM_TORCH_PROFILER_RECORD_SHAPES='1',
                    VLLM_TORCH_PROFILER_WITH_STACK='0',VLLM_TORCH_PROFILER_WITH_FLOPS='0',VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY='0')
@@ -123,10 +139,13 @@ def main():
         c={'schema_version':1,'model':'pangu-92b','platform':'a5','devices':a.devices,'changes':[],'resolved_changes':[],
            'identity':{'architecture':hf['architectures'][0],'weights':str(weights),'quantization':'mxfp8','dtype':'bfloat16',
              'kv_cache_dtype':'hif8_ds_mla','tp':a.tp,'dp':a.dp,'pp':a.pp,'ep':a.tp*a.dp,'graph':a.graph,'mtp':a.mtp,'npu_ids':a.npu_ids,
-             'max_batched_tokens':a.max_batched_tokens,'max_seqs':a.max_seqs,
+             'max_batched_tokens':a.max_batched_tokens,'max_seqs':a.max_seqs,'pd_mode':a.pd_mode or 'off',
              'aligned_decode':aligned_decode_effective,'aligned_decode_env':aligned_decode_env},
            'env':selected,'service':{'argv':args,'base_url':f'http://127.0.0.1:{a.port}/v1','served_model':'pangu-92b',
-              'ready_timeout':1800,'request_timeout':300,'shutdown_timeout':45,
+              # A degraded host can spend several minutes per shard loading;
+              # the longer readiness allowance does not change frozen identity,
+              # protocol or workload fields.
+              'ready_timeout':3600,'request_timeout':300,'shutdown_timeout':45,
               'smoke':{'enabled':True,'prompt':'Reply with OK.','max_tokens':8,'timeout':60}},
            'evaluation':{'dataset':str(dataset),'scope':'RULER two-task subset, 48 samples','metric':'ruler_official',
               'official_metrics':str(ruler/'scripts/eval/synthetic/constants.py'),'context_limit':32768-a.mtp*3,
@@ -154,6 +173,23 @@ def main():
                           attempted=result['attempted'],succeeded=result['succeeded'],failed=result['failed'],skipped=result['skipped'],timeout=result['timeout'])
             write_json(task/'validation.json',status)
             if not a.quality_only:
+                if a.pd_mode=='mixed':
+                    # Single-instance mixed P/D: the normal service already
+                    # handles both phases; prove it with one overlapping
+                    # prefill-heavy + decode-heavy window before the frozen
+                    # benchmark/profile chain runs.
+                    status['stage']='pd-mixed-probe'
+                    pd_mixed_probe(path,config)
+                    status['pd_mixed_probe']='passed'
+                    write_json(task/'validation.json',status)
+                if a.pd_mode=='split':
+                    # Same-host split: real KV-transfer evidence via the front's
+                    # /metrics_snapshot plus both engine logs, before the frozen
+                    # benchmark/profile chain runs.
+                    status['stage']='pd-split-probe'
+                    pd_split_probe(path,config)
+                    status['pd_split_probe']='passed'
+                    write_json(task/'validation.json',status)
                 # Device profile first: a real trace must exist before any multi-hour
                 # decode group can fail; the six-group contract itself is unchanged.
                 status['stage']='device-profile'

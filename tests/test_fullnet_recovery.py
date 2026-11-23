@@ -6,7 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fullnet.evaluation import evaluate, smoke_request
-from fullnet.measurements import _csv_device_kernel_rows, _trace_device_kernel_events
+from fullnet.measurements import (_capture_parse_evidence, _csv_device_kernel_rows,
+                                  _offline_parse_profiles, _trace_device_kernel_events,
+                                  msprof_shadow_toolkit)
 from fullnet.store import read_json, rows
 
 
@@ -93,6 +95,79 @@ def test_profile_requires_structural_non_cpu_device_kernel_evidence(tmp_path):
                         "empty,AI_CORE,0\n"
                         "rms_norm,AI_CORE,12\n")
     assert _csv_device_kernel_rows(csv_path) == 1
+
+
+def test_device_csv_requires_positive_duration_and_device_identity(tmp_path):
+    csv_path = tmp_path / "Device.csv"
+    csv_path.write_text("Device Id,Task Type,Duration(us)\n"
+                        "0,AI_CORE,0\n"
+                        "0,AICPU,15\n"
+                        "0,AI_CORE,12\n")
+    assert _csv_device_kernel_rows(csv_path) == 1
+
+
+def test_profiler_shadow_does_not_modify_source_sdk_and_keeps_executable(tmp_path):
+    toolkit = tmp_path / "toolkit"
+    binary = toolkit / "bin" / "msprof"
+    profiler = toolkit / "tools" / "profiler" / "profiler_tool" / "analysis" / "msprof"
+    binary.parent.mkdir(parents=True)
+    profiler.mkdir(parents=True)
+    binary.write_bytes(b"msprof")
+    binary.chmod(0o755)
+    script = profiler / "msprof.py"
+    script.write_text("print('ok')\n")
+    source_before = {str(p.relative_to(toolkit)): p.read_bytes() for p in toolkit.rglob("*") if p.is_file()}
+    run = tmp_path / "run"
+    run.mkdir()
+    result = msprof_shadow_toolkit(toolkit, run)
+    assert result["msprof_py_exists"] is True
+    assert {str(p.relative_to(toolkit)): p.read_bytes() for p in toolkit.rglob("*") if p.is_file()} == source_before
+    if os.name == "posix":
+        assert (tmp_path / "run" / "performance" / "msprof-shadow" / "tools" / "profiler" / "bin" / "msprof").stat().st_mode & 0o111
+
+
+def test_parse_evidence_preserves_error_tail_and_relax_keeps_exec_bit(tmp_path):
+    run = tmp_path / "run"
+    profiles = run / "profiles" / "rank0"
+    profiles.mkdir(parents=True)
+    log = profiles / "parse.log"
+    log.write_text("first-error\nfinal-tail-error\n")
+    executable = profiles / "msprof-helper"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o755)
+    evidence = _capture_parse_evidence(run, run / "performance")
+    assert evidence["logs"][0]["tail"].rstrip("\r\n").endswith("final-tail-error")
+    if os.name == "posix":
+        assert executable.stat().st_mode & 0o111
+
+
+def test_offline_parse_keeps_first_error_and_does_not_accept_empty_trace(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    profiles = run / "profiles"
+    (profiles / "rank0_ascend_pt" / "PROF_0").mkdir(parents=True)
+    (profiles / "rank1_ascend_pt" / "PROF_1").mkdir(parents=True)
+    shadow = run / "performance" / "msprof-shadow"
+    shadow.mkdir(parents=True)
+    msprof_py = shadow / "msprof.py"
+    msprof_py.write_text("# fixture\n")
+    (run / "performance" / "profiler-tools.json").parent.mkdir(parents=True, exist_ok=True)
+    (run / "performance" / "profiler-tools.json").write_text(json.dumps({
+        "home": str(tmp_path / "toolkit"),
+        "env_updates": {},
+        "shadow_toolkit": {"msprof_py": str(msprof_py)},
+    }))
+    (run / "config.json").write_text(json.dumps({"service": {"argv": [sys.executable]}}))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1, stdout="later error\n", stderr="first offline ERROR\n")
+
+    monkeypatch.setattr("fullnet.measurements.subprocess.run", fake_run)
+    result = _offline_parse_profiles(run)
+    assert len(calls) == 2
+    assert result["first_error"] == "first offline ERROR"
+    assert result["acceptance"] == "not_accepted"
 
 
 def test_pangu_runner_exports_failure_report_before_run_exists(tmp_path, monkeypatch):

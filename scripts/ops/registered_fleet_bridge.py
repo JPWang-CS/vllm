@@ -358,11 +358,36 @@ def terminal_controller_state(value):
             and value.get('credentials_persisted') is False)
 
 
+def controller_process_alive(task_dir, pid=None, proc_root=Path('/proc'), uid=None):
+    """Match this task's controller, including launchers without ACTIVE.json."""
+    task_dir = str(task_dir)
+    if uid is None:
+        uid = os.getuid() if hasattr(os, 'getuid') else None
+    candidates = [proc_root / str(pid)] if type(pid) is int else []
+    try:
+        candidates.extend(p for p in proc_root.iterdir() if p.name.isdecimal())
+    except OSError:
+        pass
+    for process in candidates:
+        try:
+            if uid is not None and process.stat().st_uid != uid:
+                continue
+            args = process.joinpath('cmdline').read_bytes().split(b'\0')
+            if task_dir.encode() in args and any(
+                Path(os.fsdecode(arg)).name == 'glm_task.py' for arg in args if arg
+            ):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def reconcile_status(broker):
     """Refresh business cases separately from GLM/controller liveness."""
     code = r'''import json,pathlib,sys,time
 r=pathlib.Path(sys.argv[1]);task=sys.argv[2];sys.path.insert(0,str(r))
 from scripts.ops import deployment_matrix as matrix
+from scripts.ops.registered_fleet_bridge import controller_process_alive, terminal_controller_state
 p=r/'runs'/task;out={'at':time.time(),'task':task}
 if (p/'deployment-matrix.json').is_file():
  # A stale job-state file is not evidence of a live job.
@@ -388,13 +413,8 @@ for name in ('STATE.json','ACTIVE.json'):
   except ValueError:out[name]={'status':'incomplete_json'}
 # These counts describe the controller, never model acceptance.
 c=out.get('STATE.json',{});active=out.get('ACTIVE.json',{});pid=active.get('controller_pid')
-alive=False
-if type(pid) is int:
- try:
-  text=pathlib.Path('/proc')/str(pid)/'cmdline'
-  alive=str(p).encode() in text.read_bytes()
- except OSError:pass
-out['controller_status']='running' if alive else ('exited' if type(c.get('exit')) is int else 'not_running')
+alive=controller_process_alive(p,pid)
+out['controller_status']='running' if alive else ('exited' if terminal_controller_state(c) else 'not_running')
 f=p/'BACKGROUND_STATUS.json';t=f.with_suffix('.tmp');t.write_text(json.dumps(out,ensure_ascii=False));t.replace(f)
 print(json.dumps({'task':task,'controller_status':out['controller_status'],'at':out['at']}))
 '''

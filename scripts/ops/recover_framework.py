@@ -95,6 +95,7 @@ def snapshot(root, task):
 r=pathlib.Path(sys.argv[1]); ids=json.loads(sys.argv[2]); out=[]
 for ident in ids:
  t=r/'runs'/ident; e=r/'models/pangu-92b/experiments'/ident
+ if not e.is_dir(): e=r/'models/pangu-7b/experiments'/ident
  v={'task':ident}
  for base,name in [(t,'job-state.json'),(t,'validation.json'),(e,'config.json'),(e,'state.json'),(e,'results.json'),(e,'smoke.json'),(e/'performance','summary.json'),(e/'performance','profile-artifacts.json')]:
   p=base/name
@@ -112,6 +113,38 @@ print(json.dumps(out,ensure_ascii=False))
     value = {"at": time.time(), "cases": json.loads(result.stdout)}
     write(task / "progress.json", value)
     return value
+
+
+def _normalized_plan_key(plan):
+    """Return the retry-budget identity; reasons and scheduling limits are excluded."""
+    plan = plan or {}
+    value = {
+        "tp": plan.get("tp", 2),
+        "dp": plan.get("dp", 1),
+        "graph": plan.get("graph", "eager"),
+        "mtp": plan.get("mtp", 0),
+        "pd_mode": plan.get("pd_mode") or "off",
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _execution_policy(task):
+    """Load an optional task-local budget without removing the hard upper bounds."""
+    defaults = {"max_total_jobs": 20, "max_failures_per_plan": 3}
+    path = Path(task) / "repair" / "EXECUTION_POLICY.json"
+    if not path.is_file():
+        return {**defaults, "per_plan": False}
+    value = read(path)
+    if not isinstance(value, dict):
+        raise ValueError("execution policy must be an object")
+    policy = {}
+    for key, hard_max in (("max_total_jobs", 24), ("max_failures_per_plan", 3)):
+        candidate = value.get(key, defaults[key])
+        if type(candidate) is not int or candidate < 1 or candidate > hard_max:
+            raise ValueError(f"execution policy {key} must be an integer in 1..{hard_max}")
+        policy[key] = candidate
+    policy["per_plan"] = True
+    return policy
 
 
 def inspect_previous(root, task):
@@ -164,10 +197,31 @@ def start(root, task, plan):
     current = snapshot(root, task)
     if any(v.get("job-state.json", {}).get("status") == "running" for v in current["cases"]):
         raise ValueError("existing recovery case is running; wait before starting another")
-    failed = sum(v.get("job-state.json", {}).get("status") == "failed" for v in current["cases"])
-    if failed >= 3 or len(ledger["cases"]) >= 20:
-        raise ValueError("recovery budget exhausted; retain evidence for main-agent review")
-    allowed = {"tp", "dp", "graph", "mtp", "max_batched_tokens", "max_seqs", "disable_aligned_decode", "reason"}
+    policy = _execution_policy(task)
+    records = {v.get("task"): v for v in current["cases"]}
+    classifications = {}
+    classification_path = task / "repair/RUN_CLASSIFICATIONS.json"
+    if classification_path.exists():
+        try:
+            classifications = read(classification_path)
+        except (ValueError, OSError):
+            classifications = {}
+
+    def runtime_failure(record):
+        """Only explicit resource conflicts are excluded from retry budgets.
+        Classifications live in RUN_CLASSIFICATIONS.json with their evidence;
+        communication and execution failures remain counted."""
+        if record.get("job-state.json", {}).get("status") != "failed":
+            return False
+        entry = classifications.get(record.get("task") or "") or {}
+        if entry.get("classification") == "resource":
+            return False
+        detail = str(record.get("validation.json", {}).get("detail", ""))
+        if any(tag in detail for tag in ("target device is occupied", "port already in use",
+                                         "insufficient healthy empty devices")):
+            return False
+        return True
+    allowed = {"tp", "dp", "graph", "mtp", "max_batched_tokens", "max_seqs", "disable_aligned_decode", "pd_mode", "reason"}
     if set(plan) - allowed:
         raise ValueError("unexpected plan fields")
     tp, dp = plan.get("tp", 2), plan.get("dp", 1)
@@ -179,13 +233,37 @@ def start(root, task, plan):
         raise ValueError("unsupported graph or MTP plan")
     if type(batched) is not int or batched not in {512, 4096, 10240, 16384} or type(seqs) is not int or seqs not in {4, 8, 32, 56}:
         raise ValueError("unsupported scheduling limits")
+    pd_mode = plan.get("pd_mode")
+    if pd_mode not in {None, "mixed", "split"}:
+        raise ValueError("unsupported pd_mode plan")
     if type(plan.get("disable_aligned_decode", False)) is not bool or not isinstance(plan.get("reason"), str) or not plan["reason"].strip():
         raise ValueError("configuration change needs a reason and a boolean alignment setting")
+    if len(ledger["cases"]) >= policy["max_total_jobs"]:
+        raise ValueError("recovery total-job budget exhausted; retain evidence for main-agent review")
+    if policy["per_plan"]:
+        plan_key = _normalized_plan_key(plan)
+        failures_by_plan = {}
+        for entry in ledger["cases"]:
+            record = records.get(entry.get("task"))
+            if record is not None and runtime_failure(record):
+                key = _normalized_plan_key(entry.get("plan"))
+                failures_by_plan[key] = failures_by_plan.get(key, 0) + 1
+        if failures_by_plan.get(plan_key, 0) >= policy["max_failures_per_plan"]:
+            raise ValueError("recovery plan failure budget exhausted; use a different normalized plan")
+    else:
+        failures = sum(runtime_failure(record) for record in current["cases"])
+        if failures >= policy["max_failures_per_plan"]:
+            raise ValueError("recovery budget exhausted; retain evidence for main-agent review")
+    # Same-host PD split launches TWO independent instances (producer +
+    # consumer), so the device budget doubles; this mirrors the
+    # workers_needed check inside run_pangu92b.py, which otherwise rejects
+    # the job at startup ("project or worker count mismatch").
+    workers_needed = tp * dp * (2 if pd_mode == "split" else 1)
     cards = inventory(root, task)["available"]
-    if len(cards) < tp * dp:
-        write(task / "blocked.json", {"reason": "insufficient healthy empty devices", "required": tp * dp, "available": cards})
+    if len(cards) < workers_needed:
+        write(task / "blocked.json", {"reason": "insufficient healthy empty devices", "required": workers_needed, "available": cards})
         raise RuntimeError("insufficient healthy empty devices; no process was stopped")
-    cards = cards[:tp * dp]
+    cards = cards[:workers_needed]
     mapping = container(root, [str(root / 'tools/npu-smi'), 'info', '-m'], source=True)
     (task / 'device-mapping.txt').write_text(mapping.stdout + mapping.stderr, encoding='utf-8')
     physical = {}
@@ -207,6 +285,8 @@ def start(root, task, plan):
             "--dataset", config["dataset"], "--devices", *map(str, runtime_cards), "--npu-ids", *map(str, cards),
             "--tp", str(tp), "--dp", str(dp), "--graph", graph, "--mtp", str(mtp), "--requests", "32",
             "--max-batched-tokens", str(batched), "--max-seqs", str(seqs)]
+    if pd_mode:
+        args += ["--pd-mode", pd_mode]
     if plan.get("disable_aligned_decode", False):
         args.append("--disable-aligned-decode")
     body = "set -e; source " + shlex.quote(config["cann_source"]) + "; exec " + shlex.join(args)
@@ -272,8 +352,11 @@ def fleet_submit(root, task, request_id, action, host, job, script=None, devices
         raise ValueError('fleet args must be bounded strings')
     script_name = None
     if action == 'run':
-        if not devices:
-            raise ValueError('fleet run requires explicit host NPU IDs')
+        # An explicit [] is a declared device-free job (e.g. container network
+        # probes); a missing --devices (None) stays rejected so a device job
+        # can never silently launch without its NPU list.
+        if devices is None:
+            raise ValueError('fleet run requires an explicit host NPU ID list; pass [] only for a device-free script job')
         if not isinstance(script, str) or '\\' in script:
             raise ValueError('fleet run script must be relative to task repair/')
         from pathlib import PurePosixPath
@@ -492,6 +575,10 @@ def main():
         result["baseline_failure"] = config["previous_run"]
         result["reference"] = config["reference"]
         result.update(inspect_previous(root, task))
+    # matrix fleet-inventory/fleet-status return request lists; normalize so
+    # the standards attachment never corrupts an already-successful submission.
+    if not isinstance(result, dict):
+        result = {"result": result}
     result['readable_server_standards'] = standards(root, task)
     print(json.dumps(result, ensure_ascii=False), flush=True)
 

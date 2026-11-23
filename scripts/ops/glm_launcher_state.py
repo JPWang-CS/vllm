@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any
 
 
@@ -51,3 +52,19 @@ def decode_terminal_state(payload: bytes | str) -> dict[str, Any] | None:
 def should_stop_proxy(*, terminal_state: dict[str, Any] | None, controller_submitted: bool) -> bool:
     """Keep the tunnel for any submitted controller until its real terminal record."""
     return terminal_state is not None or not controller_submitted
+
+
+def canonical_repair_bash_rule(project: str, supplied: str) -> str:
+    """Return the one reviewed Bash prefix accepted for framework repair tasks."""
+    entry = f"python3 -B {project}/scripts/ops/recover_framework.py"
+    if supplied not in (entry, entry + ":*"):
+        raise ValueError("repair tasks must use the recover_framework.py project entrypoint")
+    return entry + ":*"
+
+
+def bash_matches_argv(command: str, expected: list[str]) -> bool:
+    """Match equivalent shell quoting while rejecting extra/chained commands."""
+    try:
+        return shlex.split(command, posix=True) == expected
+    except ValueError:
+        return False

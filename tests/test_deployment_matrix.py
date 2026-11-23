@@ -24,7 +24,10 @@ def test_matrix_enumerates_platforms_and_blocks_unsupported_modes(tmp_path):
             "same_host_pd_split", "pd_disaggregated"}.issubset(
         {case["scenario"] for case in data["cases"]})
     assert all(case["status"] == "blocked" for case in data["cases"]
-               if case["scenario"] != "single_host_tpdp")
+               if case["scenario"] != "single_host_tpdp" and
+               not (case["scenario"] == "pangu7b_single_card" and case["platform"] == "a5"))
+    assert next(case for case in data["cases"]
+                if case["scenario"] == "pangu7b_single_card" and case["platform"] == "a5")["status"] == "planned"
     assert all(case["launch_contract"]["fixed_evaluation_samples"] == 48 for case in data["cases"])
     assert all(case["launch_contract"]["requests"] == 32 and case["launch_contract"]["warmups"] == 2
                for case in data["cases"])

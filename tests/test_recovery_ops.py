@@ -59,6 +59,75 @@ def test_recovery_refuses_to_overlap_running_model_job(tmp_path, monkeypatch):
         module.start(tmp_path, tmp_path, {"tp": 2, "dp": 1})
 
 
+def test_task_policy_counts_failures_per_normalized_plan(tmp_path, monkeypatch):
+    module = load("recover_framework")
+    task = tmp_path / "task"
+    (task / "repair").mkdir(parents=True)
+    (task / "repair" / "EXECUTION_POLICY.json").write_text(json.dumps({
+        "max_total_jobs": 24, "max_failures_per_plan": 3
+    }))
+    plans = [
+        {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0, "pd_mode": None},
+        {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0, "pd_mode": None},
+        {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0, "pd_mode": None},
+        {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0, "pd_mode": "mixed"},
+    ]
+    ledger = {"cases": [{"task": f"failed-{i}", "plan": plan} for i, plan in enumerate(plans)]}
+    (task / "ledger.json").write_text(json.dumps(ledger))
+    monkeypatch.setattr(module, "snapshot", lambda root, current_task: {"cases": [
+        {"task": f"failed-{i}", "job-state.json": {"status": "failed"},
+         "validation.json": {"detail": "real communication failure"}}
+        for i in range(4)
+    ]})
+    monkeypatch.setattr(module, "inventory", lambda root, current_task: {"available": []})
+    with pytest.raises(RuntimeError, match="insufficient healthy empty devices"):
+        module.start(tmp_path, task, {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0,
+                                      "pd_mode": "split", "reason": "test different plan"})
+
+
+def test_task_policy_blocks_same_plan_at_three_failures(tmp_path, monkeypatch):
+    module = load("recover_framework")
+    task = tmp_path / "task"
+    (task / "repair").mkdir(parents=True)
+    (task / "repair" / "EXECUTION_POLICY.json").write_text(json.dumps({
+        "max_total_jobs": 24, "max_failures_per_plan": 3
+    }))
+    plan = {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0, "pd_mode": None}
+    (task / "ledger.json").write_text(json.dumps({"cases": [
+        {"task": f"failed-{i}", "plan": plan} for i in range(3)
+    ]}))
+    monkeypatch.setattr(module, "snapshot", lambda root, current_task: {"cases": [
+        {"task": f"failed-{i}", "job-state.json": {"status": "failed"},
+         "validation.json": {"detail": "real communication failure"}}
+        for i in range(3)
+    ]})
+    with pytest.raises(ValueError, match="plan failure budget exhausted"):
+        module.start(tmp_path, task, {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0,
+                                      "reason": "test same plan"})
+
+
+def test_legacy_task_without_policy_keeps_global_three_failure_budget(tmp_path, monkeypatch):
+    module = load("recover_framework")
+    task = tmp_path / "task"
+    (task / "repair").mkdir(parents=True)
+    plans = [
+        {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0},
+        {"tp": 4, "dp": 1, "graph": "eager", "mtp": 0},
+        {"tp": 2, "dp": 1, "graph": "eager", "mtp": 3},
+    ]
+    (task / "ledger.json").write_text(json.dumps({"cases": [
+        {"task": f"failed-{i}", "plan": plan} for i, plan in enumerate(plans)
+    ]}))
+    monkeypatch.setattr(module, "snapshot", lambda root, current_task: {"cases": [
+        {"task": f"failed-{i}", "job-state.json": {"status": "failed"},
+         "validation.json": {"detail": "real communication failure"}}
+        for i in range(3)
+    ]})
+    with pytest.raises(ValueError, match="recovery budget exhausted"):
+        module.start(tmp_path, task, {"tp": 1, "dp": 4, "graph": "eager", "mtp": 0,
+                                      "reason": "legacy compatibility"})
+
+
 def test_write_scope_allows_orchestration_and_rejects_original_kernel(tmp_path):
     guard = Path(__file__).resolve().parents[1] / 'scripts/ops/task_write_guard.py'
     root = tmp_path / 'project'

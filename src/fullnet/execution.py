@@ -122,6 +122,61 @@ def stop_owned(process, timeout):
     process.wait(timeout=timeout)
 
 
+def service_identity(c):
+    """Optional non-root uid for the service process only.
+
+    The CANN profiler analysis stage (msprof) refuses to run when its euid
+    differs from the CANN file owner (a root service on a non-root-owned CANN
+    tree can make the export stage produce a CPU-only trace; the export stage still
+    produced a CPU-only trace). The supervisor stays root for device guards and
+    cleanup, while the service and its profiler children run as the owner.
+    """
+    spec = c["service"].get("uid")
+    if not spec or os.name != "posix" or not hasattr(os, "getuid") or os.getuid() != 0:
+        return None
+    import pwd
+    record = pwd.getpwuid(int(spec))
+
+    def apply():
+        os.setgroups([record.pw_gid])
+        os.setgid(record.pw_gid)
+        os.setuid(record.pw_uid)
+    return apply
+
+
+def _yield_service_paths(run, c, env):
+    """Hand the service-writable trees to the service uid before launch."""
+    spec = c["service"].get("uid")
+    if not spec or os.name != "posix" or not hasattr(os, "getuid") or os.getuid() != 0:
+        return
+    import pwd
+    record = pwd.getpwuid(int(spec))
+    run_root = Path(run).resolve(strict=True)
+    project = run_root.parents[3]
+    ipc_root = (project / ".i").resolve(strict=True)
+    ipc = Path(env.get("VLLM_RPC_BASE_PATH", ""))
+    roots = [(run_root, run_root)]
+    if ipc:
+        try:
+            ipc_real = ipc.resolve(strict=True)
+            if ipc_real.is_relative_to(ipc_root) and ipc_real.parent == ipc_root:
+                roots.append((ipc_real, ipc_root))
+        except (OSError, RuntimeError):
+            pass
+    for base, boundary in roots:
+        stack = [base]
+        while stack:
+            path = stack.pop()
+            try:
+                if path.is_symlink() or not path.resolve(strict=True).is_relative_to(boundary):
+                    continue
+                os.chown(path, record.pw_uid, record.pw_gid, follow_symlinks=False)
+                if path.is_dir():
+                    stack.extend(child for child in path.iterdir() if not child.is_symlink())
+            except (OSError, RuntimeError):
+                continue
+
+
 def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=False):
     run = experiment(root, model, run_id)
     c = read_json(run / "config.json")
@@ -144,11 +199,25 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
                     raise RuntimeError("change verification failed: " + change["name"])
             argv = c["service"]["argv"]
             append_json(run / "commands.jsonl", {"phase": "service", "argv": argv, "at": utc()})
+            preexec = service_identity(c)
+            _yield_service_paths(run, c, env)
+            # Deferred import: measurements imports private_environment from here.
+            from .measurements import prepare_profiler_tools
+            # Profiler children are spawned by the running service, so the
+            # msprof toolchain (shadow PATH + sqlite compat lib) must already
+            # be part of the launch environment before the service starts.
+            tools = prepare_profiler_tools(run, c)
+            env.update(tools.get("env_updates") or {})
             with (run / "logs" / "service.log").open("w", encoding="utf-8") as output:
-                process = subprocess.Popen(argv, cwd=root, env=env, stdout=output, stderr=subprocess.STDOUT,
-                                           start_new_session=os.name == "posix")
+                popen_kwargs = {"cwd": root, "env": env, "stdout": output,
+                                "stderr": subprocess.STDOUT,
+                                "start_new_session": os.name == "posix"}
+                if preexec is not None:
+                    popen_kwargs["preexec_fn"] = preexec
+                process = subprocess.Popen(argv, **popen_kwargs)
                 write_json(run / "process.json", {"pid": process.pid, "argv": argv, "at": utc(), "cwd": str(root),
-                           "ipc_directory": env['VLLM_RPC_BASE_PATH'], "keep_ready": keep_ready})
+                           "ipc_directory": env['VLLM_RPC_BASE_PATH'], "keep_ready": keep_ready,
+                           "service_uid": c["service"].get("uid")})
                 deadline = time.monotonic() + c["service"].get("ready_timeout", 1800)
                 while True:
                     if process.poll() is not None:

@@ -1,71 +1,124 @@
 # Fullnet Lab
 
-整网推理实验框架，用于运行模型、验证精度、分析性能，并比较算子替换对整网的影响。支持按 A3、A5 分别维护环境和实验；模型项目与公共工具保存在同一仓库。
+**通过 AI 完成模型部署、精度验证、性能分析与算子替换。**
 
-## 安装
+Fullnet Lab 将整网实验组织为可执行的工作流程。你提供模型、设备和任务目标，具备终端与文件操作能力的 AI 按项目 Skill 检查环境、运行任务、处理错误并整理结果。模型配置、代码变更和实验结果分别保存，便于复现与对比。
 
-Python 3.10 或更新版本。安装器在项目内创建独立环境；系统缺少 pip 时可用官方 virtualenv 引导：
+[开始使用](#让-ai-开始工作) · [工作流](#工作流) · [项目 Skills](#项目-skills) · [文档与安装](#文档与安装)
+
+## 让 AI 开始工作
+
+### 1. 获取项目
 
 ```bash
-python scripts/bootstrap.py --extras test
-source envs/fullnet/bin/activate
+git clone https://github.com/JPWang-CS/vllm.git fullnet-lab
+cd fullnet-lab
 ```
 
-框架编排层仅依赖 PyYAML。模型使用其已验证的 PyTorch、torch_npu、vLLM 和平台插件环境，框架安装不升级这些软件。CANN 在进入任务时手动 source。
+使用能读取仓库文件、执行终端命令并连接目标环境的 AI 编程助手，打开这个目录。项目的 [AGENTS.md](AGENTS.md) 提供工作入口，`.agents/skills/` 定义各项任务的执行方法。
 
-## 从一个模型开始
+### 2. 告诉 AI 你的目标
+
+复制下面的任务说明，填入实际信息：
 
 ```text
-models/
-  pangu-7b/
-    model.yaml
-    configs/          A3/A5 配置与本机配置
-    changes/          算子替换、图模式等独立变更
-    baselines/        已接受实验的索引
-    experiments/      每次运行的配置、日志、结果和报告
-  pangu-92b/
-src/fullnet/          公共运行、评测、比较与报告
-.agents/skills/       AI 工作流程
-scripts/             数据准备与受控上机入口
-docs/                评测、替换和性能方法
+请阅读 AGENTS.md，使用项目 Skill 完成模型部署与验证。
+
+模型：模型名称、发布版本或已有权重目录
+硬件：设备型号、可使用的设备，以及 A3/A5 平台
+工作范围：目标连接、个人容器和项目目录
+运行环境：已有模型 Python 环境与 CANN 入口；也可由你核对后准备项目私有环境
+评测目标：使用指定数据集；已有评测协议时沿用其输入、生成参数和评分规则
+
+请先检查环境与权重，启动服务并完成一个真实生成请求。
+随后验证精度、采集性能与设备流水，保存原始结果和可复现命令。
+根据首个错误自行定位并修复项目内的问题，继续执行后续步骤。
+在指定容器和项目目录中工作，复用现有环境，并保留每次尝试的记录。
 ```
 
-复制目标平台配置为本机 `.local.yaml`，填写设备和环境变量。先验证和保存配置，再运行：
+AI 会根据实际模型和运行时准备配置。仓库提供 Ascend A3/A5 配置入口；部署参数、模型适配和 profiler 由所选环境决定。模型安装、权重获取和数据准备见 [从零准备环境与模型](docs/from-zero.md)。
 
-```bash
-fullnet check --config models/pangu-7b/configs/a3.local.yaml
-fullnet plan --config models/pangu-7b/configs/a3.local.yaml --run a3-native-001
-# 在项目个人 tmux 会话内执行，任务命令和日志保存在项目目录
-fullnet run --model pangu-7b --run a3-native-001
-fullnet report --model pangu-7b --run a3-native-001
+### 3. 查看结果并继续任务
+
+每次实验都保存配置、固定输入、日志、输出与报告。你可以继续要求 AI：
+
+```text
+读取这次实验的结果，解释主要性能瓶颈，并给出下一项可验证的改动。
 ```
 
-`plan` 保存实际配置和固定输入。`run` 启动本次服务、检查模型名、发出真实请求、评分并结束本次进程组。任务得分、数值一致性和资源释放分别记录，失败样本保留在评测分母中。
+或接入自己的算子包：
 
-AI 可按自然语言运行：“在 A3 上启动 Pangu 7B，沿用已有固定评测数据，保存原生基线。”项目 [AGENTS.md](AGENTS.md) 路由到相应 skill。服务器执行遵循个人容器、私有环境和项目目录边界。
+```text
+在项目私有环境中接入这个算子包，找到模型中的实际调用位置。
+保留原生基线，用相同输入验证替换后的数值与性能，解释对整网的影响。
+```
 
-## 本地检查工作流程
+## 工作流
 
-以下示例启动一个回显 HTTP fixture，检查配置、状态、请求、评分和收尾；无需模型和设备：
+![Fullnet Lab 部署与验证工作流](docs/assets/fullnet-workflow.png)
+
+AI 先读取项目规则、模型说明和对应 Skill，再核对原始配置、运行时加载路径、权重、设备健康与空闲状态。随后固定输入和生成协议，独立完成真实短生成、固定评测、服务性能和设备 profile；每个阶段保留原始日志、退出码和失败原因。修改或算子替换必须创建独立实验，并与原生基线使用相同条件对照。
+
+## 可以完成哪些工作
+
+| 工作 | 执行内容 | 主要产物 |
+|---|---|---|
+| 模型部署 | 核对环境、获取或复用权重、配置服务、发送真实请求 | 启动配置、服务日志、请求响应 |
+| 精度验证 | 固定输入、模板与生成参数，评分或进行数值对照 | 分项得分、失败样本、误差记录 |
+| 性能分析 | 测量请求时延与吞吐，采集设备计算和通信记录 | 性能摘要、设备 trace、瓶颈分析 |
+| 算子替换 | 加载独立算子产物，在模型调用点接入并与原生对照 | 加载与命中记录、精度及性能对比 |
+| 调试与优化 | 根据首错定位问题，修改后复测，记录模型收益 | 修复说明、复现步骤、对照报告 |
+
+外部算子可以来自独立算子库、Ascend C 工程或其他扩展项目。算子仓负责构建产物，Fullnet Lab 负责模型接入与整网验证，具体接入方式见 [外部算子接入](docs/operator-replacement.md)。
+
+## 项目 Skills
+
+AI 按任务读取对应 Skill，也可以沿部署、验证、分析和优化的顺序连续执行。
+
+| Skill | 适用任务 |
+|---|---|
+| [fullnet-validate](.agents/skills/fullnet-validate/SKILL.md) | 环境检查、模型启动与精度验证 |
+| [fullnet-profile](.agents/skills/fullnet-profile/SKILL.md) | 整网与设备性能采集 |
+| [fullnet-debug](.agents/skills/fullnet-debug/SKILL.md) | 定位启动、执行、通信和数值问题 |
+| [fullnet-replace](.agents/skills/fullnet-replace/SKILL.md) | 接入外部算子并建立原生对照 |
+| [fullnet-optimize](.agents/skills/fullnet-optimize/SKILL.md) | 根据整网热点设计并验证优化 |
+
+## 文档与安装
+
+Python 3.10 或更新版本。在项目中创建框架环境：
 
 ```bash
-export FULLNET_PYTHON="$(command -v python)"
+python3 scripts/bootstrap.py --extras download,evaluation
+source envs/fullnet/bin/activate
+fullnet doctor
+```
+
+框架环境负责配置、任务管理与结果分析；模型计算使用运行配置中指定的推理环境。安装脚本支持缺少系统 pip 的 Python，离线安装与已有模型环境的使用方法见 [安装说明](docs/from-zero.md)。
+
+AI 生成本机配置后，也可以用命令行复现部署与评测过程。先用仓库内的 HTTP fixture 检查框架流程：
+
+```bash
+fullnet check --config examples/offline/config.yaml
 fullnet plan --config examples/offline/config.yaml --run workflow-001
 fullnet run --model workflow-fixture --run workflow-001
 fullnet report --model workflow-fixture --run workflow-001
-python -m pytest -q
 ```
 
-## 算子替换与性能
+每次任务的配置、输入、日志、输出和报告都保存在项目目录。结果查看与后续分析可以继续交给 AI；后台任务提交与恢复见 [长任务与 AI 执行](docs/background-jobs.md)。
 
-外部算子包通过模型目录中的变更配置与适配器接入。原生、替换分别运行，同条件比较。编译、打包由算子仓维护，框架接收其独立产物。
+## 使用文档
 
-- [运行与评测](docs/evaluation.md)
-- [长任务与 AI 执行](docs/background-jobs.md)
-- [从零准备环境与模型](docs/from-zero.md)
-- [外部算子接入](docs/operator-replacement.md)
-- [性能分析](docs/profiling.md)
-- [实现与验证记录](STATUS.md)
-- [Pangu 7B](models/pangu-7b/README.md) · [Pangu 92B](models/pangu-92b/README.md)
+| 想了解的内容 | 文档 |
+|---|---|
+| 安装框架、准备模型与数据 | [从零准备环境与模型](docs/from-zero.md) |
+| 设置输入、评分与数值比较 | [运行与评测](docs/evaluation.md) |
+| 保存长任务并在断线后恢复 | [长任务与 AI 执行](docs/background-jobs.md) |
+| 接入 wheel、OPP 包或动态库 | [外部算子接入](docs/operator-replacement.md) |
+| 组织性能采样与设备分析 | [性能分析](docs/profiling.md) |
+| 查看模型配置与适配入口 | [模型目录](models/) |
+| 部署矩阵与完整验收条件 | [部署验证](docs/deployment-validation.md) |
+| 按阶段定位失败 | [调试方法](docs/debugging.md) |
 
-服务性能与设备 profiler 的正式采集随模型实验配置执行。当前实现包含启动、固定样本评测、原生/替换输出比较和张量数值检查；实际 A3/A5 验证状态见各模型项目记录。
+## License
+
+[Apache License 2.0](LICENSE)

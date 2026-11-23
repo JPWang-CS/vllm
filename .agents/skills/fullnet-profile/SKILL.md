@@ -5,11 +5,13 @@ description: 对已通过正确性检查的模型实验采集整网与设备性�
 
 # 整网性能与算子归因
 
-读取目标实验的冻结配置、精度结果和基线引用，以及 `docs/profiling.md`。先确定比较对象、固定负载、采样次数、设备和服务配置。
+先读取冻结配置、精度结果、服务参数和基线引用。当前仓库没有独立的 `fullnet profile` 子命令；设备采集由模型 runner 调用 `src/fullnet/measurements.py` 的 profile 方法完成，结果写入实验目录。
 
-1. 使用实际环境自带的 `vllm bench serve --help` 核对命令。保存每组 argv、官方原始 JSON、请求数量、输入输出长度、并发、TTFT、TPOT、ITL、吞吐与失败数。质量数据与强制输出长度的性能数据分别保存。
-2. 在任务私有目录调用 msprof 或 torch_npu profiler。采样前检查当前版本 `--help`；应用参数作为 argv 或已审核脚本传入。预热、采集区间和结束条件写进脚本，保存原始 trace。
-3. 比较服务时间线、设备计算、通信、Host 提交与空闲。保持模型/负载一致，区分设备算子区间和端到端收益；profile replay 结果单独记录。
-4. 把热点对应到实际调用路径与实现。提出一项可验证的修改，说明预计影响的指标，再做原生/修改对照。保存负收益、精度失败与范围限制。
+1. 用实际环境的 `python -B -m vllm.entrypoints.cli.main bench serve --help` 核对 benchmark 参数。保存实际 argv、原始 JSON、请求数、warmup、输入/输出长度、并发、TTFT、TPOT、ITL、吞吐和失败数。每组性能按冻结的负载合同执行；当前盘古代表验证包含六组。
+2. 采样前读取服务侧 profiler 接口和当前 `msprof`/`torch_npu` 的 `--help`。HTTP 客户端 trace 不能替代服务进程设备采集；预热、开始/停止条件和采集目录写入任务配置。
+3. 任务目录至少保留 `performance/profile-commands.json`、`performance/profile-artifacts.json`、原始 trace 或 kernel CSV。仓库的设备证据索引识别 `trace_view.json`、设备 kernel CSV 及 `op_summary` CSV，并要求正时长的设备 kernel 事件或带设备/任务类型的非空 kernel 行；CPU trace、空文件和无法确认设备事件的文件不通过。
+4. profile daemon 或解析阶段失败时保留完整任务副本，不删除原始 trace。使用当前环境实际支持的 `msprof` 离线 `import` 和 `op_summary` 方法恢复索引；具体 argv 以任务记录和现场 `--help` 为准，不把跨版本命令写死。离线恢复出的行数仍需回填 `profile-artifacts.json` 并重新检查设备字段。
+5. 把设备计算、通信、Host 提交、空闲和端到端服务时间分开报告。profile replay 只说明离线归因，不等于线上收益；设备区间也不等于 TTFT、TPOT 或完整请求时延。
+6. 原生与替换固定模型、权重、输入、输出、并行、设备和采样条件。先保存原始证据，再提出一个可验证改动；报告收益、退化、适用形状、样本数和未测范围。
 
-采样和模型服务都由项目 tmux 管理。采集结束后检查本任务进程、端口和设备占用，只清理本任务。报告引用原始实验，不复制历史数据充当本次实测。
+采样和模型服务由项目私有 tmux 管理。结束后只检查并清理本任务进程、端口和设备；换卡或改变并行布局后，原生基线和候选结果整组重测。
