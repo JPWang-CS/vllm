@@ -193,5 +193,3 @@ if __name__ == "__main__":
     demo = plan(["host-a", "host-b"], [2, 2], {"tp": 4, "dp": 1})
     print(json.dumps(demo, ensure_ascii=False))
     sys.exit(0)
-
-

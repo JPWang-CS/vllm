@@ -218,5 +218,3 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     main()
-
-
