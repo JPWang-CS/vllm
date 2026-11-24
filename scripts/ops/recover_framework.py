@@ -130,7 +130,7 @@ def _normalized_plan_key(plan):
 
 def _execution_policy(task):
     """Load an optional task-local budget without removing the hard upper bounds."""
-    defaults = {"max_total_jobs": 20, "max_failures_per_plan": 3}
+    defaults = {"max_total_jobs": 20, "max_failures_per_plan": 3, "quality_only": False}
     path = Path(task) / "repair" / "EXECUTION_POLICY.json"
     if not path.is_file():
         return {**defaults, "per_plan": False}
@@ -143,6 +143,9 @@ def _execution_policy(task):
         if type(candidate) is not int or candidate < 1 or candidate > hard_max:
             raise ValueError(f"execution policy {key} must be an integer in 1..{hard_max}")
         policy[key] = candidate
+    if "quality_only" in value and type(value["quality_only"]) is not bool:
+        raise ValueError("execution policy quality_only must be a boolean")
+    policy["quality_only"] = value.get("quality_only", defaults["quality_only"])
     policy["per_plan"] = True
     return policy
 
@@ -221,9 +224,12 @@ def start(root, task, plan):
                                          "insufficient healthy empty devices")):
             return False
         return True
-    allowed = {"tp", "dp", "graph", "mtp", "max_batched_tokens", "max_seqs", "disable_aligned_decode", "pd_mode", "reason"}
+    allowed = {"tp", "dp", "graph", "mtp", "max_batched_tokens", "max_seqs", "disable_aligned_decode", "pd_mode", "reason", "quality_only"}
     if set(plan) - allowed:
         raise ValueError("unexpected plan fields")
+    if "quality_only" in plan and type(plan["quality_only"]) is not bool:
+        raise ValueError("quality_only must be a boolean")
+    quality_only = bool(plan.get("quality_only", False) or policy.get("quality_only", False))
     tp, dp = plan.get("tp", 2), plan.get("dp", 1)
     if (tp, dp) not in {(2, 1), (4, 1), (2, 2), (1, 4)}:
         raise ValueError("unsupported parallel plan")
@@ -285,6 +291,13 @@ def start(root, task, plan):
             "--dataset", config["dataset"], "--devices", *map(str, runtime_cards), "--npu-ids", *map(str, cards),
             "--tp", str(tp), "--dp", str(dp), "--graph", graph, "--mtp", str(mtp), "--requests", "32",
             "--max-batched-tokens", str(batched), "--max-seqs", str(seqs)]
+    if quality_only:
+        args.append("--quality-only")
+    # Optional task-scoped HCCL/OMNI environment overrides: applied only when
+    # this task owns repair/env-overrides.json; run_pangu92b filters the keys.
+    override = task / "repair/env-overrides.json"
+    if override.is_file():
+        args += ["--env-override-file", str(override)]
     if pd_mode:
         args += ["--pd-mode", pd_mode]
     if plan.get("disable_aligned_decode", False):
@@ -294,7 +307,9 @@ def start(root, task, plan):
                "-e", "PYTHONPATH=" + str(root / "src"), "-e", "FULLNET_CA_BUNDLE=" + str(root / "cache/trust/workstation-ca.pem"),
                config["container"], "bash", "--noprofile", "--norc", "-c", body]
     write(run / "requested-job.json", {"argv": command})
-    write(run / "recovery-plan.json", {"plan": plan, "devices": cards, "runtime_physical_ids": runtime_cards})
+    recorded_plan = dict(plan)
+    recorded_plan["quality_only"] = quality_only
+    write(run / "recovery-plan.json", {"plan": recorded_plan, "devices": cards, "runtime_physical_ids": runtime_cards})
     receipt = subprocess.run([sys.executable, "-B", str(root / "scripts/ops/submit_job.py"), "--project", str(root),
                               "--task", ident, "--config", str(run / "requested-job.json"), "--tmux", config["tmux"]],
                              cwd=root, capture_output=True, text=True, timeout=30)
@@ -343,6 +358,27 @@ def fleet_submit(root, task, request_id, action, host, job, script=None, devices
         raise ValueError('fleet host must be a registered IPv4 address') from exc
     if address.version != 4 or str(address) != host:
         raise ValueError('fleet host must be a canonical IPv4 address')
+    # A native executor may own an exclusive device case while the GLM is
+    # still alive.  Keep status/inventory and other hosts usable, but stop a
+    # stale controller from queueing a competing device run on that host.
+    # This is intentionally opt-in: without explicit exclusive_active and
+    # exclusive_host fields the existing fleet behavior is unchanged.
+    if action == 'run':
+        active_path = task / 'repair' / 'ACTIVE_BUSINESS.json'
+        if active_path.is_file():
+            active = read(active_path)
+            if (isinstance(active, dict)
+                    and active.get('exclusive_active') is True
+                    and isinstance(active.get('owner'), str)
+                    and bool(active.get('owner').strip())
+                    and isinstance(active.get('exclusive_host'), str)
+                    and active.get('exclusive_host') == host):
+                existing = active.get('case_id') or active.get('job') or active.get('request_id') or 'recorded active case'
+                raise RuntimeError(
+                    'fleet run refused for exclusive host %s: owner=%s case/job=%s; '
+                    'read %s and reuse the active case/job instead of submitting another run'
+                    % (host, active['owner'], existing, active_path)
+                )
     devices = [] if devices is None else devices
     if (not isinstance(devices, list) or len(set(devices)) != len(devices) or
             any(type(value) is not int or not 0 <= value < 32 for value in devices)):

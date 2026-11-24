@@ -20,6 +20,11 @@ from .evaluation import evaluate, headers, smoke_request, validate_samples
 from .store import RunLock, append_json, experiment, inside, read_json, rows, state, utc, write_json
 
 
+def profiler_deferred(c):
+    """Whether this acceptance stage intentionally defers profiler setup."""
+    return "profile" in set(c.get("measurements", {}).get("deferred_stages", []))
+
+
 @contextmanager
 def graceful_termination():
     """Let the supervisor's finally block release its owned service on TERM."""
@@ -58,6 +63,15 @@ def plan(root, c, run_id):
 def private_environment(run, c, root=None):
     env = os.environ.copy()
     env.update(c.get("env", {}))
+    if profiler_deferred(c):
+        for key in (
+            "VLLM_TORCH_PROFILER_DIR",
+            "VLLM_TORCH_PROFILER_RECORD_SHAPES",
+            "VLLM_TORCH_PROFILER_WITH_STACK",
+            "VLLM_TORCH_PROFILER_WITH_FLOPS",
+            "VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY",
+        ):
+            env.pop(key, None)
     paths = {"HOME": "home", "TMPDIR": "tmp", "TMP": "tmp", "TEMP": "tmp",
              "XDG_CONFIG_HOME": "home/config", "XDG_CACHE_HOME": "cache", "PIP_CACHE_DIR": "cache/pip",
              "TORCH_EXTENSIONS_DIR": "cache/torch-extensions", "TRITON_CACHE_DIR": "cache/triton",
@@ -201,12 +215,23 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
             append_json(run / "commands.jsonl", {"phase": "service", "argv": argv, "at": utc()})
             preexec = service_identity(c)
             _yield_service_paths(run, c, env)
-            # Deferred import: measurements imports private_environment from here.
-            from .measurements import prepare_profiler_tools
-            # Profiler children are spawned by the running service, so the
-            # msprof toolchain (shadow PATH + sqlite compat lib) must already
-            # be part of the launch environment before the service starts.
-            tools = prepare_profiler_tools(run, c)
+            if profiler_deferred(c):
+                tools = {"env_updates": {}}
+                write_json(run / "performance" / "profiler-tools.json", {
+                    "acceptance": "deferred_by_user",
+                    "prepared_before_launch": False,
+                    "reason": "quality-only stage defers profile and performance",
+                    "env_updates": {},
+                })
+                state(run, "profile", "deferred_by_user", reason="quality-only stage")
+                state(run, "performance", "deferred_by_user", reason="quality-only stage")
+            else:
+                # Deferred import: measurements imports private_environment from here.
+                from .measurements import prepare_profiler_tools
+                # Profiler children are spawned by the running service, so the
+                # msprof toolchain (shadow PATH + sqlite compat lib) must already
+                # be part of the launch environment before the service starts.
+                tools = prepare_profiler_tools(run, c)
             env.update(tools.get("env_updates") or {})
             with (run / "logs" / "service.log").open("w", encoding="utf-8") as output:
                 popen_kwargs = {"cwd": root, "env": env, "stdout": output,

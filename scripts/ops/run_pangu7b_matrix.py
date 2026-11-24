@@ -1,4 +1,4 @@
-"""Pangu 7B single-card matrix runner: 48-sample quality, device profile, six groups.
+"""Pangu 7B single-card matrix runner: quality first, profile/performance optional.
 
 Joins the existing Pangu 7B validator contract (models/pangu-7b, single card,
 eager, TP1/DP1/PP1) to the deployment-matrix acceptance: profile is collected
@@ -23,6 +23,15 @@ WORKLOADS = [
 ]
 
 
+def quality_phase_complete(status, quality_only):
+    """Require finalization success; evaluation alone is not a completed run."""
+    return (status.get("protocol_pass") is True and status.get("device_empty_after_exit") is True and
+            status.get("quality_status") != "failed" and status.get("error") is None and
+            status.get("finalization_error") is None and
+            (quality_only or (status.get("profile") == "passed" and
+                              status.get("performance_phase") == "passed")))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--project", type=Path, required=True)
@@ -36,6 +45,7 @@ def main():
     p.add_argument("--port", type=int, default=18321)
     p.add_argument("--dataset", type=Path, help="Reuse previously frozen 48-sample subset")
     p.add_argument("--keep-ready", action="store_true")
+    p.add_argument("--quality-only", action="store_true", help="Run fixed 48-sample functional/accuracy stage only")
     a = p.parse_args()
     root = a.project.resolve(strict=True)
     task = (root / "runs" / a.task).resolve(strict=True)
@@ -47,7 +57,15 @@ def main():
                runtime / "source/image/workspace/omniinfer/components/omni-models", runtime / "source/image/workspace/omniinfer/components/omni-cache",
                runtime / "source/image/workspace/omniinfer/components/omni-eplb", runtime / "source/image/workspace/omniinfer"]
     evaluation_deps = root / "envs/evaluation-deps"
-    paths = [root / "src", evaluation_deps, *[v for v in sources if v.is_dir()]]
+    private_deps = Path(env["FULLNET_PRIVATE_DEPS"]).resolve() if env.get("FULLNET_PRIVATE_DEPS") else None
+    source_overlay = Path(env["FULLNET_SOURCE_OVERLAY"]).resolve() if env.get("FULLNET_SOURCE_OVERLAY") else None
+    paths = []
+    if source_overlay and source_overlay.is_dir():
+        paths.append(source_overlay)
+    paths.append(root / "src")
+    if private_deps and private_deps.is_dir():
+        paths.append(private_deps)
+    paths.extend([evaluation_deps, *[v for v in sources if v.is_dir()]])
     cann_python = Path(env["ASCEND_HOME_PATH"]) / "python/site-packages"
     paths.append(cann_python)
     env["PYTHONPATH"] = os.pathsep.join(map(str, paths))
@@ -60,6 +78,10 @@ def main():
         target = task / suffix
         target.mkdir(parents=True, exist_ok=True)
         env[key] = str(target)
+    env["NUMBA_CACHE_DIR"] = str(task / "cache/numba")
+    env["MPLCONFIGDIR"] = str(task / "cache/matplotlib")
+    Path(env["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+    Path(env["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
     env.update(PYTHONDONTWRITEBYTECODE="1", TORCH_DEVICE_BACKEND_AUTOLOAD="0", NO_PROXY="localhost,127.0.0.1,::1",
                ASCEND_RT_VISIBLE_DEVICES=str(a.device_index), ASCEND_VISIBLE_DEVICES=str(a.device_index),
                VLLM_USE_V1="1", VLLM_WORKER_MULTIPROC_METHOD="spawn", VLLM_PLUGINS="omni-npu,omni_custom_models,omni_npu_patches",
@@ -70,9 +92,15 @@ def main():
     # set, and its config validator auto-enables profiler='torch' exactly when
     # VLLM_TORCH_PROFILER_DIR is present (run -7b03: 404 without it). Same four
     # vars as the frozen 92B reference env; identity fields unchanged.
-    env.update(VLLM_TORCH_PROFILER_DIR=str(root / "models/pangu-7b/experiments" / a.task / "profiles"),
-               VLLM_TORCH_PROFILER_RECORD_SHAPES="1", VLLM_TORCH_PROFILER_WITH_STACK="0",
-               VLLM_TORCH_PROFILER_WITH_FLOPS="0", VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY="0")
+    if not a.quality_only:
+        env.update(VLLM_TORCH_PROFILER_DIR=str(root / "models/pangu-7b/experiments" / a.task / "profiles"),
+                   VLLM_TORCH_PROFILER_RECORD_SHAPES="1", VLLM_TORCH_PROFILER_WITH_STACK="0",
+                   VLLM_TORCH_PROFILER_WITH_FLOPS="0", VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY="0")
+    else:
+        for key in ("VLLM_TORCH_PROFILER_DIR", "VLLM_TORCH_PROFILER_RECORD_SHAPES",
+                    "VLLM_TORCH_PROFILER_WITH_STACK", "VLLM_TORCH_PROFILER_WITH_FLOPS",
+                    "VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY"):
+            env.pop(key, None)
     if env.get("FULLNET_CA_BUNDLE"):
         for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT"):
             env[key] = env["FULLNET_CA_BUNDLE"]
@@ -93,7 +121,8 @@ def main():
             raise RuntimeError("target device is occupied")
 
     status = {"model": "pangu-7b", "platform": a.platform, "model_requests": "not_run",
-              "profile": "not_run", "stage": "device-pre"}
+              "profile": "not_run", "performance": "not_run", "quality_only": a.quality_only,
+              "stage": "device-pre"}
     run = None
     try:
         config = read_json(a.weights / "config.json")
@@ -149,6 +178,7 @@ def main():
                         "--max-num-batched-tokens", "512", "--max-num-seqs", "4",
                         "--gpu-memory-utilization", "0.7", "--enforce-eager", "--seed", "0"],
                         "base_url": f"http://127.0.0.1:{a.port}/v1", "served_model": "pangu",
+                        "smoke": {"enabled": True, "prompt": "Reply with OK.", "max_tokens": 8, "timeout": 60},
                         # 3600s: same contention headroom as the 92B runner fix (run -01).
                         "ready_timeout": 3600, "request_timeout": 240, "shutdown_timeout": 30},
              "evaluation": {"dataset": str(dataset), "scope": "Pangu 7B / RULER niah_single_1 + vt; 48 fixed samples",
@@ -156,6 +186,7 @@ def main():
                             "context_limit": 16384, "seed": 42, "temperature": 0, "top_p": 1,
                             "chat_template_kwargs": {}, "add_special_tokens": False, "minimum_score": None},
              "measurements": {"requests": 32, "warmups": 2,
+                              "deferred_stages": ["profile", "performance"] if a.quality_only else [],
                               # Orchestration ceiling only; contract identical to the 92B runner.
                               "timeout_per_group": 21600, "workloads": WORKLOADS}}
         status["stage"] = "device-before-launch"
@@ -169,14 +200,19 @@ def main():
                           succeeded=result["succeeded"], failed=result["failed"], skipped=result["skipped"],
                           timeout=result["timeout"])
             write_json(task / "validation.json", status)
-            # Profile BEFORE performance: a real trace must exist before any
-            # multi-hour decode group can fail; the six-group contract is unchanged.
-            status["stage"] = "device-profile"
-            collect_profile(path, config)
-            status["profile"] = "passed" if read_json(path / "state.json")["phases"].get("profile", {}).get("status") == "passed" else "failed"
-            write_json(task / "validation.json", status)
-            status["stage"] = "measurements"
-            collect_performance(path, config)
+            if a.quality_only:
+                status["profile"] = "deferred_by_user"
+                status["performance"] = "deferred_by_user"
+            else:
+                # Profile BEFORE performance: a real trace must exist before any
+                # multi-hour decode group can fail; the six-group contract is unchanged.
+                status["stage"] = "device-profile"
+                collect_profile(path, config)
+                status["profile"] = "passed" if read_json(path / "state.json")["phases"].get("profile", {}).get("status") == "passed" else "failed"
+                write_json(task / "validation.json", status)
+                status["stage"] = "measurements"
+                collect_performance(path, config)
+                status["performance"] = "passed"
             status["stage"] = "evaluated"
             report(path)
             export_run(root, path, task / "export")
@@ -214,9 +250,7 @@ def main():
             except Exception as exc:
                 status["finalization_error"] = type(exc).__name__ + ": " + str(exc)
         (task / "validation.json").write_text(json.dumps(status, ensure_ascii=False, indent=2))
-    complete = (status.get("protocol_pass") is True and status.get("profile") == "passed"
-                and status.get("performance_phase") == "passed"
-                and status.get("device_empty_after_exit") is True)
+    complete = quality_phase_complete(status, a.quality_only)
     sys.exit(0 if complete else 1)
 
 

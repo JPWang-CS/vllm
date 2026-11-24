@@ -128,6 +128,46 @@ def test_legacy_task_without_policy_keeps_global_three_failure_budget(tmp_path, 
                                       "reason": "legacy compatibility"})
 
 
+@pytest.mark.parametrize(
+    ("plan_quality_only", "policy_quality_only", "expected"),
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+def test_recovery_start_emits_quality_only_argv_without_touching_device(tmp_path, monkeypatch,
+                                                                          plan_quality_only,
+                                                                          policy_quality_only,
+                                                                          expected):
+    module = load("recover_framework")
+    root = tmp_path / "project"
+    task = root / "task"
+    (root / "scripts/ops").mkdir(parents=True)
+    (root / "runs").mkdir()
+    (task / "repair").mkdir(parents=True)
+    (root / "scripts/ops/framework-recovery.local.json").write_text(json.dumps({
+        "python": "/opt/python", "reference": "/ref.json", "weights": "/weights",
+        "dataset": "/dataset", "tmux": "/tmux", "cann_source": "/cann.sh",
+        "container": "container",
+    }))
+    if policy_quality_only:
+        (task / "repair/EXECUTION_POLICY.json").write_text(json.dumps({
+            "max_total_jobs": 20, "max_failures_per_plan": 3, "quality_only": True,
+        }))
+    monkeypatch.setattr(module, "snapshot", lambda root, current_task: {"cases": []})
+    monkeypatch.setattr(module, "inventory", lambda root, current_task: {"available": [0, 1]})
+    monkeypatch.setattr(module, "container", lambda *args, **kwargs: type(
+        "Completed", (), {"returncode": 0, "stdout": "0 0 0 0 0\n1 1 1 1 1\n", "stderr": ""}
+    )())
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: type(
+        "Completed", (), {"returncode": 0, "stdout": "submitted", "stderr": ""}
+    )())
+    plan = {"tp": 2, "dp": 1, "graph": "eager", "mtp": 0, "reason": "test",
+            "quality_only": plan_quality_only}
+    module.start(root, task, plan)
+    request = json.loads(next((root / "runs").glob("*/requested-job.json")).read_text())
+    argv = request["argv"]
+    command = " ".join(argv)
+    assert ("--quality-only" in command) is expected
+
+
 def test_write_scope_allows_orchestration_and_rejects_original_kernel(tmp_path):
     guard = Path(__file__).resolve().parents[1] / 'scripts/ops/task_write_guard.py'
     root = tmp_path / 'project'

@@ -22,6 +22,70 @@ def identifier(value):
     return value
 
 
+PROJECT_COPY_SKIP_DIRS = frozenset({
+    "experiments", "__pycache__", "weights", "cache", "envs", "runtime",
+    "assets", "build", "tmp", ".git",
+})
+
+
+def copy_project_directory_allowed(name, python_package=False):
+    """Keep model runtime/assets/build trees read-only and out of staging."""
+    return name not in PROJECT_COPY_SKIP_DIRS or (name == "cache" and python_package)
+
+
+def remote_directory_contains_python(sftp, path):
+    """Identify a Python package/cache without importing or executing it."""
+    import stat
+    try:
+        return any(
+            stat.S_ISREG(entry.st_mode)
+            and (entry.filename == "__init__.py" or entry.filename.endswith(".py"))
+            for entry in sftp.listdir_attr(path)
+        )
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def container_to_host_read_path(path, mounts):
+    """Map a container path through an explicit read-only/bind mount list."""
+    container_path = PurePosixPath(path)
+    if not container_path.is_absolute() or ".." in container_path.parts:
+        raise ValueError("container source path must be absolute and traversal-free")
+    candidates = []
+    for mount in mounts:
+        if not isinstance(mount, dict) or mount.get("Type") != "bind":
+            continue
+        source = PurePosixPath(mount.get("Source", ""))
+        destination = PurePosixPath(mount.get("Destination", ""))
+        if (not source.is_absolute() or not destination.is_absolute()
+                or ".." in source.parts or ".." in destination.parts):
+            continue
+        if container_path.is_relative_to(destination):
+            candidates.append((len(destination.parts), source, destination))
+    if not candidates:
+        raise ValueError("container source path has no registered bind mount: " + str(path))
+    _, source, destination = max(candidates, key=lambda item: item[0])
+    relative = container_path.relative_to(destination)
+    host_path = source / relative
+    if not host_path.is_absolute() or ".." in host_path.parts:
+        raise ValueError("mapped host source path is not canonical: " + str(host_path))
+    return str(host_path)
+
+
+def health_status_ok(text):
+    """Accept both npu-smi Health: OK and Health Status: OK formats."""
+    values = re.findall(r"Health(?:\s+Status)?\s*:\s*([A-Za-z]+)\b", text, re.IGNORECASE)
+    if not values:
+        # A3 npu-smi info tables put the status in the column after the device
+        # name: | Ascend910 | OK |. Only treat explicit status cells as health.
+        values = re.findall(r"\|\s*(OK|Healthy|Error|Warning|Fault|Unknown)\s*\|", text, re.IGNORECASE)
+    return bool(values) and all(value.upper() == "OK" for value in values)
+
+
+def process_table_empty(text):
+    return bool(re.search(r"No process in device|No running processes found in NPU", text, re.IGNORECASE))
+
+
 def validate_request(value, targets):
     if set(value) - {"request_id", "action", "host", "job", "script", "devices", "args", "asset"}:
         raise ValueError("unexpected fleet request fields")
@@ -49,13 +113,22 @@ def validate_request(value, targets):
 # Runs inside the selected personal container, under the target job directory.
 RUNNER = r'''
 import json,os,pathlib,signal,subprocess,sys,time
+import re
+def health_status_ok(text):
+ values=re.findall(r"Health(?:\s+Status)?\s*:\s*([A-Za-z]+)\b",text,re.IGNORECASE)
+ if not values: values=re.findall(r"\|\s*(OK|Healthy|Error|Warning|Fault|Unknown)\s*\|",text,re.IGNORECASE)
+ return bool(values) and all(value.upper()=='OK' for value in values)
+def process_table_empty(text):
+ return bool(re.search(r"No process in device|No running processes found in NPU",text,re.IGNORECASE))
 j=pathlib.Path(sys.argv[1]).resolve(strict=True); c=json.loads((j/'config.json').read_text())
 root=pathlib.Path(c['project']).resolve(strict=True)
 if not j.is_relative_to(root):raise ValueError('job outside project')
 os.chdir(root)
 for k,s in {'HOME':'home','TMPDIR':'tmp','TMP':'tmp','TEMP':'tmp','XDG_CACHE_HOME':'cache','HF_HOME':'cache/hf','TORCH_EXTENSIONS_DIR':'cache/torch','TRITON_CACHE_DIR':'cache/triton','ASCEND_PROCESS_LOG_PATH':'logs/ascend','ASCEND_WORK_PATH':'tmp/ascend'}.items():
  p=j/s;p.mkdir(parents=True,exist_ok=True);os.environ[k]=str(p)
-os.environ.update(PYTHONDONTWRITEBYTECODE='1',FULLNET_REMOTE_PROJECT=str(root),FULLNET_FLEET_JOB_ROOT=str(j),FULLNET_SERVER_ENV_ROOT=c['management'],FULLNET_FLEET_DEVICES=json.dumps(c['devices']),PYTHONPATH=str(root/'src'))
+overlay=j/'repair'/'source'/'src'
+python_roots=[str(overlay),str(root/'src')] if overlay.is_dir() else [str(root/'src')]
+os.environ.update(PYTHONDONTWRITEBYTECODE='1',FULLNET_REMOTE_PROJECT=str(root),FULLNET_FLEET_JOB_ROOT=str(j),FULLNET_SERVER_ENV_ROOT=c['management'],FULLNET_FLEET_DEVICES=json.dumps(c['devices']),PYTHONPATH=os.pathsep.join(python_roots))
 os.environ.pop('ASCEND_RT_VISIBLE_DEVICES',None);os.environ.pop('ASCEND_VISIBLE_DEVICES',None)
 # Host-matched npu-smi: the broker stages the host ELF into <job>/tools/npu-smi;
 # containers without it fall back to the shared wrapper (which needs a real
@@ -80,7 +153,7 @@ try:
    p=subprocess.run([str(tool),'info','-t','proc-mem','-i',str(d)],capture_output=True,text=True,timeout=30,env=dlenv)
    (j/f'device-{d}-pre.txt').write_text(h.stdout+h.stderr+p.stdout+p.stderr)
    import re
-   if h.returncode or p.returncode or not re.search(r'Health\s+Status\s*:\s*OK\b',h.stdout) or 'No process in device' not in p.stdout:raise RuntimeError(f'device {d} is not confirmed healthy and empty')
+   if h.returncode or p.returncode or not health_status_ok(h.stdout) or not process_table_empty(p.stdout):raise RuntimeError(f'device {d} is not confirmed healthy and empty')
   # Scripts derive logical/physical runtime IDs from the saved official mapping;
   # host NPU IDs are deliberately not reused as runtime device IDs here.
  write('state.json',{'status':'running','runner_pid':os.getpid(),'started_at':time.time(),'devices':c['devices']})
@@ -152,12 +225,42 @@ class Broker:
                 listing = json.loads(self.call(self.control, shlex.join(["docker", "exec", "-i", "--user", "0", self.targets[self.control_host]["container"], "python3", "-B", "-c", code, origin]), timeout=60))
                 if not any(x["path"].endswith(".safetensors") for x in listing["files"]):
                     raise ValueError("source has no real model weight shards")
+                mounts_raw = self.call(self.control, shlex.join([
+                    "docker", "inspect", "--format", "{{json .Mounts}}",
+                    self.targets[self.control_host]["container"],
+                ]), timeout=30).strip()
+                try:
+                    mounts = json.loads(mounts_raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("control container mount inspection was not valid JSON") from exc
+                if not isinstance(mounts, list):
+                    raise ValueError("control container mount inspection did not return a list")
+                source_host_root = container_to_host_read_path(listing["root"], mounts)
                 source_sf = self.control.open_sftp(); target_sf = client.open_sftp()
                 transferred = 0
+                progress_path = self.local / (value["request_id"] + "-copy-progress.json")
+                remote_progress = job + "/copy-progress.json"
+                progress = {
+                    "request_id": value["request_id"], "job": value.get("job", value["request_id"]),
+                    "asset": asset, "status": "copying", "source_container_root": listing["root"],
+                    "source_host_root": source_host_root, "files_total": len(listing["files"]),
+                    "files_completed": 0, "files_skipped_existing": 0, "transferred_bytes": 0,
+                }
+
+                def save_progress():
+                    self.atomic(target_sf, remote_progress, progress)
+                    temporary = progress_path.with_suffix(progress_path.suffix + ".tmp")
+                    temporary.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+                    temporary.replace(progress_path)
+
                 try:
+                    self.helper.mkdirs(target_sf, job, 0o700)
+                    save_progress()
                     for entry in listing["files"]:
                         rel = PurePosixPath(entry["path"])
                         if rel.is_absolute() or ".." in rel.parts:raise ValueError("asset path outside model")
+                        progress.update(current_file=rel.as_posix(), current_file_status="starting")
+                        save_progress()
                         dest = root + "/assets/weights/" + asset + "/" + rel.as_posix()
                         self.helper.mkdirs(target_sf, str(PurePosixPath(dest).parent), 0o700)
                         actual = self.call(client, shlex.join(["realpath", "-e", str(PurePosixPath(dest).parent)])).strip()
@@ -167,17 +270,33 @@ class Broker:
                             attrs = target_sf.lstat(dest)
                             import stat
                             if not stat.S_ISREG(attrs.st_mode):raise ValueError("existing target asset is not regular")
-                            if attrs.st_size == entry["size"]:continue
+                            if attrs.st_size == entry["size"]:
+                                progress["files_completed"] += 1
+                                progress["files_skipped_existing"] += 1
+                                progress.update(current_file_status="skipped_existing", transferred_bytes=transferred)
+                                save_progress()
+                                continue
                             raise ValueError("existing asset size differs; preserve it and inspect")
                         except FileNotFoundError:pass
                         partial = dest + "." + self.task + ".partial"
-                        with source_sf.open(listing["root"] + "/" + rel.as_posix(), "rb") as inp, target_sf.open(partial, "w") as out:
+                        with source_sf.open(source_host_root + "/" + rel.as_posix(), "rb") as inp, target_sf.open(partial, "w") as out:
+                            if hasattr(out, "set_pipelined"):
+                                out.set_pipelined(True)
                             while True:
                                 data = inp.read(4 * 1024 * 1024)
                                 if not data:break
                                 out.write(data);transferred += len(data)
                         if target_sf.stat(partial).st_size != entry["size"]:raise RuntimeError("incomplete asset transfer")
                         target_sf.rename(partial, dest)
+                        progress["files_completed"] += 1
+                        progress.update(current_file_status="completed", transferred_bytes=transferred)
+                        save_progress()
+                    progress.update(status="completed", current_file_status=None)
+                    save_progress()
+                except BaseException as exc:
+                    progress.update(status="failed", error=type(exc).__name__ + ": " + str(exc)[:1000])
+                    save_progress()
+                    raise
                 finally:
                     source_sf.close();target_sf.close()
                 return {"asset":asset,"transferred_bytes":transferred,"files":len(listing["files"]),"target":root+"/assets/weights/"+asset,"acceptance":"files_transferred_model_not_validated"}
@@ -230,6 +349,12 @@ print(json.dumps(o,ensure_ascii=False))
                         import stat
                         rel = relative + "/" + ent.filename
                         if stat.S_ISDIR(ent.st_mode):
+                            if ent.filename in {"runtime", "assets", "build", "tmp", "cache", "envs", "experiments", "__pycache__", ".git"} and not (
+                                ent.filename == "cache" and remote_directory_contains_python(
+                                    source, source_root + "/" + rel
+                                )
+                            ):
+                                continue
                             copy_scripts(rel)
                         elif stat.S_ISREG(ent.st_mode) and PurePosixPath(rel).suffix in {".py", ".sh"}:
                             if ent.st_size > 2_000_000:
@@ -248,9 +373,14 @@ print(json.dumps(o,ensure_ascii=False))
                         try:entries = source.listdir_attr(self.project + "/" + relative)
                         except FileNotFoundError:return
                         for ent in entries:
-                            if ent.filename in {"experiments", "__pycache__", "weights", "cache", "envs", ".git"}:
-                                continue
                             rel = relative + "/" + ent.filename
+                            if not copy_project_directory_allowed(
+                                ent.filename,
+                                python_package=(ent.filename == "cache" and remote_directory_contains_python(
+                                    source, self.project + "/" + rel
+                                )),
+                            ):
+                                continue
                             if stat.S_ISDIR(ent.st_mode):
                                 copy_project(rel)
                             elif stat.S_ISREG(ent.st_mode) and PurePosixPath(rel).suffix in {".py", ".sh", ".md", ".toml", ".json", ".txt"} and ".local." not in ent.filename:

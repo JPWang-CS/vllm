@@ -35,6 +35,7 @@ import uvicorn
 
 UPSTREAM_TIMEOUT = 6 * 60 * 60
 STATE = {"urls": {}, "stats": Counter(), "last": {}}
+EXPECTED_MODEL = "pangu-92b"
 app = FastAPI()
 
 
@@ -68,18 +69,49 @@ def _post_json(url, payload, timeout=UPSTREAM_TIMEOUT):
         return None, repr(exc).encode(), "text/plain"
 
 
+def model_ids(payload, expected_model=EXPECTED_MODEL):
+    try:
+        value = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+        data = value["data"]
+        if not isinstance(data, list) or not data:
+            return None
+        ids = [item["id"] for item in data]
+        if any(not isinstance(item, str) or not item for item in ids):
+            return None
+        if len(set(ids)) != len(ids) or expected_model not in ids:
+            return None
+        return ids
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def readiness_result(results, expected_model=EXPECTED_MODEL):
+    parsed = {role: model_ids(body, expected_model) if status == 200 else None
+              for role, (status, body) in results.items()}
+    valid = all(parsed.values()) and len({frozenset(ids) for ids in parsed.values()}) == 1
+    if not valid:
+        return JSONResponse(status_code=503, content={
+            "status": "waiting",
+            "prefill": {"http_status": results["prefill"][0], "model_ids": parsed["prefill"]},
+            "decode": {"http_status": results["decode"][0], "model_ids": parsed["decode"]},
+        })
+    return {"status": "ready",
+            "instances": {role: status for role, (status, _) in results.items()},
+            "data": [{"id": model_id, "object": "model", "owned_by": "vllm"}
+                     for model_id in parsed["prefill"]]}
+
+
 @app.get("/v1/models")
 @app.get("/health")
 async def readiness():
     results = {}
-    ok = True
     for role in ("prefill", "decode"):
         status, body = await run_in_threadpool(_get, STATE["urls"][role] + "/v1/models", 30)
-        results[role] = status if status is not None else body.decode(errors="replace")[:120]
-        ok = ok and status == 200
-    if ok:
-        return {"status": "ready", "instances": results}
-    return JSONResponse(status_code=503, content={"status": "waiting", "instances": results})
+        results[role] = (status, body)
+    response = readiness_result(results, STATE.get("model", EXPECTED_MODEL))
+    if isinstance(response, dict):
+        response["instances"] = {role: status for role, (status, _) in results.items()}
+    return response
 
 
 @app.get("/pd_stats")

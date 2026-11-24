@@ -1,4 +1,4 @@
-"""Real 92B native deployment: fixed quality, official performance, NPU profile."""
+"""Real 92B native deployment with quality-first acceptance."""
 import argparse,copy,json,os,re,shutil,subprocess,sys
 from pathlib import Path
 from fullnet.analysis import report
@@ -43,6 +43,7 @@ def main():
     p.add_argument('--quality-only',action='store_true');p.add_argument('--requests',type=int,default=32)
     p.add_argument('--max-batched-tokens',type=int,default=4096)
     p.add_argument('--max-seqs',type=int,default=8)
+    p.add_argument('--env-override-file',type=Path)
     aligned=p.add_mutually_exclusive_group()
     aligned.add_argument('--disable-aligned-decode',action='store_true')
     aligned.add_argument('--enable-aligned-decode',action='store_true')
@@ -74,6 +75,7 @@ def main():
         ASCEND_RT_VISIBLE_DEVICES=','.join(map(str,a.devices)),ASCEND_VISIBLE_DEVICES=','.join(map(str,a.devices)),
         HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',NO_PROXY='localhost,127.0.0.1,::1',GLOO_SOCKET_IFNAME='lo')
     apply_reference_env_overrides(env,ref.get('env_overrides',{}))
+    if a.env_override_file:apply_reference_env_overrides(env,read_json(a.env_override_file))
     aligned_decode_env=apply_aligned_decode_plan(env,disable=a.disable_aligned_decode,enable=a.enable_aligned_decode)
     aligned_decode_effective=('disabled' if aligned_decode_env=='0' else
                               'enabled' if aligned_decode_env=='1' else 'runtime_default')
@@ -92,7 +94,8 @@ def main():
         with (task/(label+'.log')).open('w') as log:r=subprocess.run(args,cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=timeout)
         write_json(task/(label+'-exit.json'),{'argv':args,'exit':r.returncode})
         if r.returncode:raise RuntimeError(label+' failed')
-    status={'model':'pangu-92b','model_requests':'not_run','profile':'not_run','stage':'device-pre','pd_mode':a.pd_mode or 'off',
+    status={'model':'pangu-92b','model_requests':'not_run','profile':'not_run','performance':'not_run','quality_only':a.quality_only,
+            'stage':'device-pre','pd_mode':a.pd_mode or 'off',
             'pd_mixed_probe':'not_run','max_batched_tokens':a.max_batched_tokens,'max_seqs':a.max_seqs,
             'aligned_decode':aligned_decode_effective,'aligned_decode_env':aligned_decode_env}
     run=None;owns_run=False;exit_code=0;failure=None
@@ -132,8 +135,14 @@ def main():
                 # run dir; plan() creates this directory before the service starts.
                 '--logs',str(root/'models/pangu-92b/experiments'/a.task/'logs')]
         target=root/'models/pangu-92b/experiments'/a.task
-        env.update(VLLM_TORCH_PROFILER_DIR=str(target/'profiles'),VLLM_TORCH_PROFILER_RECORD_SHAPES='1',
-                   VLLM_TORCH_PROFILER_WITH_STACK='0',VLLM_TORCH_PROFILER_WITH_FLOPS='0',VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY='0')
+        if not a.quality_only:
+            env.update(VLLM_TORCH_PROFILER_DIR=str(target/'profiles'),VLLM_TORCH_PROFILER_RECORD_SHAPES='1',
+                       VLLM_TORCH_PROFILER_WITH_STACK='0',VLLM_TORCH_PROFILER_WITH_FLOPS='0',VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY='0')
+        else:
+            for key in ('VLLM_TORCH_PROFILER_DIR','VLLM_TORCH_PROFILER_RECORD_SHAPES',
+                        'VLLM_TORCH_PROFILER_WITH_STACK','VLLM_TORCH_PROFILER_WITH_FLOPS',
+                        'VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY'):
+                env.pop(key,None)
         selected={k:v for k,v in env.items() if k.startswith(('VLLM_','OMNI_','HCCL_','HYBRID_','PYTORCH_NPU_','ASCEND_')) or k in
                   ('PYTHONPATH','LD_LIBRARY_PATH','FULLNET_BASELINE_VENDOR_LIBS','HF_HUB_OFFLINE','TRANSFORMERS_OFFLINE','TORCH_DEVICE_BACKEND_AUTOLOAD','GLOO_SOCKET_IFNAME')}
         c={'schema_version':1,'model':'pangu-92b','platform':'a5','devices':a.devices,'changes':[],'resolved_changes':[],
@@ -151,6 +160,7 @@ def main():
               'official_metrics':str(ruler/'scripts/eval/synthetic/constants.py'),'context_limit':32768-a.mtp*3,
               'seed':42,'temperature':0,'top_p':1,'chat_template_kwargs':{'thinking':False},'add_special_tokens':False,'minimum_score':None},
            'measurements':{'requests':a.requests,'warmups':2,
+              'deferred_stages':['profile','performance'] if a.quality_only else [],
               # Orchestration ceiling only: single-engine decode (~5 tok/s observed) makes the
               # 1024/4096-output groups run 2-4h and leaves headroom if c4 aggregate decode
               # lands low; the previous 3600s default killed case-03 mid-run in 06-01.
@@ -172,24 +182,19 @@ def main():
             status.update(model_requests='completed',score=result['score'],quality_status=result['quality_status'],protocol_pass=result['protocol_pass'],
                           attempted=result['attempted'],succeeded=result['succeeded'],failed=result['failed'],skipped=result['skipped'],timeout=result['timeout'])
             write_json(task/'validation.json',status)
+            if a.pd_mode=='mixed':
+                # P/D is a functional gate even when profile/performance are deferred.
+                status['stage']='pd-mixed-probe'
+                pd_mixed_probe(path,config)
+                status['pd_mixed_probe']='passed'
+                write_json(task/'validation.json',status)
+            if a.pd_mode=='split':
+                # Split P/D must prove real KV transfer before later stages.
+                status['stage']='pd-split-probe'
+                pd_split_probe(path,config)
+                status['pd_split_probe']='passed'
+                write_json(task/'validation.json',status)
             if not a.quality_only:
-                if a.pd_mode=='mixed':
-                    # Single-instance mixed P/D: the normal service already
-                    # handles both phases; prove it with one overlapping
-                    # prefill-heavy + decode-heavy window before the frozen
-                    # benchmark/profile chain runs.
-                    status['stage']='pd-mixed-probe'
-                    pd_mixed_probe(path,config)
-                    status['pd_mixed_probe']='passed'
-                    write_json(task/'validation.json',status)
-                if a.pd_mode=='split':
-                    # Same-host split: real KV-transfer evidence via the front's
-                    # /metrics_snapshot plus both engine logs, before the frozen
-                    # benchmark/profile chain runs.
-                    status['stage']='pd-split-probe'
-                    pd_split_probe(path,config)
-                    status['pd_split_probe']='passed'
-                    write_json(task/'validation.json',status)
                 # Device profile first: a real trace must exist before any multi-hour
                 # decode group can fail; the six-group contract itself is unchanged.
                 status['stage']='device-profile'
@@ -198,6 +203,9 @@ def main():
                 write_json(task/'validation.json',status)
                 status['stage']='measurements'
                 collect_performance(path,config)
+            else:
+                status['profile']='deferred_by_user'
+                status['performance']='deferred_by_user'
             status['stage']='evaluated'
             report(path);write_json(task/'validation.json',status)
         result=run_experiment(root,'pangu-92b',a.task,after_evaluation=finished,keep_ready=a.keep_ready)

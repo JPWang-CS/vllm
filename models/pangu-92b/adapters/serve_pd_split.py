@@ -32,6 +32,7 @@ import uvicorn
 
 app = FastAPI()
 STATE = {}
+EXPECTED_MODEL = "pangu-92b"
 
 
 def fetch(url, timeout=60):
@@ -52,15 +53,44 @@ def post_bytes(url, data, content_type, timeout=6 * 60 * 60):
         return None, repr(exc).encode(), "text/plain"
 
 
+def model_ids(payload, expected_model=EXPECTED_MODEL):
+    try:
+        value = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+        data = value["data"]
+        if not isinstance(data, list) or not data:
+            return None
+        ids = [item["id"] for item in data]
+        if any(not isinstance(item, str) or not item for item in ids):
+            return None
+        if len(set(ids)) != len(ids) or expected_model not in ids:
+            return None
+        return ids
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def readiness_result(results, expected_model=EXPECTED_MODEL):
+    parsed = {role: model_ids(body, expected_model) if status == 200 else None
+              for role, (status, body) in results.items()}
+    valid = all(parsed.values()) and len({frozenset(ids) for ids in parsed.values()}) == 1
+    if not valid:
+        return JSONResponse(status_code=503, content={
+            "status": "waiting",
+            "producer": {"http_status": results["producer"][0], "model_ids": parsed["producer"]},
+            "consumer": {"http_status": results["consumer"][0], "model_ids": parsed["consumer"]},
+        })
+    return {"status": "ready", "producer": True, "consumer": True,
+            "data": [{"id": model_id, "object": "model", "owned_by": "vllm"}
+                     for model_id in parsed["producer"]]}
+
+
 @app.get("/v1/models")
 @app.get("/health")
 async def readiness():
-    producer_ok, _ = await run_in_threadpool(fetch, STATE["urls"]["producer"] + "/v1/models", 30)
-    consumer_ok, _ = await run_in_threadpool(fetch, STATE["urls"]["consumer"] + "/v1/models", 30)
-    if producer_ok == 200 and consumer_ok == 200:
-        return {"status": "ready", "producer": True, "consumer": True}
-    return JSONResponse(status_code=503, content={"status": "waiting",
-        "producer": producer_ok, "consumer": consumer_ok})
+    results = {}
+    for role in ("producer", "consumer"):
+        results[role] = await run_in_threadpool(fetch, STATE["urls"][role] + "/v1/models", 30)
+    return readiness_result(results)
 
 
 @app.post("/v1/chat/completions")
@@ -179,8 +209,8 @@ def main():
             return
         for role in ("producer", "consumer"):
             if not ready[role]:
-                status, _ = fetch(STATE["urls"][role] + "/v1/models", 30)
-                ready[role] = status == 200
+                status, body = fetch(STATE["urls"][role] + "/v1/models", 30)
+                ready[role] = status == 200 and model_ids(body) is not None
         if ready["producer"] and ready["consumer"]:
             break
         time.sleep(5)
