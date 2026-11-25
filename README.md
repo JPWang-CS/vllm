@@ -71,6 +71,8 @@ AI 先读取项目规则、模型说明和对应 Skill，再核对原始配置�
 
 外部算子可以来自独立算子库、Ascend C 工程或其他扩展项目。算子仓负责构建产物，Fullnet Lab 负责模型接入与整网验证，具体接入方式见 [外部算子接入](docs/operator-replacement.md)。
 
+模型、配置、变更、基线和实验按[模型与实验目录规范](docs/repository-layout.md)组织。新增模型先建立 `models/<model>/model.yaml` 和 `README.md`；新增部署继续使用原模型目录，实验写入该模型的 `experiments/<run-id>/`。
+
 ## 项目 Skills
 
 AI 按任务读取对应 Skill，也可以沿部署、验证、分析和优化的顺序连续执行。
@@ -116,6 +118,7 @@ fullnet report --model workflow-fixture --run workflow-001
 | 接入 wheel、OPP 包或动态库 | [外部算子接入](docs/operator-replacement.md) |
 | 组织性能采样与设备分析 | [性能分析](docs/profiling.md) |
 | 查看模型配置与适配入口 | [模型目录](models/) |
+| 模型、配置和实验目录规范 | [模型与实验目录规范](docs/repository-layout.md) |
 | 部署矩阵与完整验收条件 | [部署验证](docs/deployment-validation.md) |
 | 按阶段定位失败 | [调试方法](docs/debugging.md) |
 

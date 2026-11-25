@@ -7,6 +7,10 @@ description: 在指定模型项目中启动推理服务，复用已定评测数�
 
 适用于“拉起模型”“验证精度”“保存原生基线”。先读目标模型的 `README.md`、`model.yaml`、本机配置和 `docs/evaluation.md`。
 
+## 目录归属
+
+模型、配置、变更、基线和实验遵循 [模型与实验目录规范](../../../docs/repository-layout.md)。使用 `models/<model>/configs/` 保存该模型配置，使用 `models/<model>/changes/<change-id>/` 保存受控变更，使用 `models/<model>/experiments/<run-id>/` 保存冻结配置、数据、日志、原始输出和报告。原生 baseline 使用一个实验，替换 candidate 使用另一个实验；每个实验内按合同保存精度、性能和 profile，输入、配置或实现合同改变时才创建新 run。不要跨模型复用本地配置或实验结果。
+
 1. 先记录原始配置和实际加载路径：个人容器、Python/CANN、平台插件、权重、卡号映射及 A3/A5。健康检查同时确认物理卡与运行时逻辑卡的映射；动态选择空闲卡不等于只选一张卡。换卡后，原生基线、固定评测、性能和 profile 必须整组重测。
 2. 权重首次使用先执行 `fullnet assets plan`、`verify-source`、`fetch`、`check`；已有权重只读核对架构、分片、tokenizer 和来源。环境变量提供凭据，不把凭据写入配置或日志。
 3. 模型 runtime 的源码、Python package data 和 native extension 必须完整进入实际执行源；不要按目录名一律排除 `cache`，其中可能是真实 Python module。数据缓存可以排除，但必须与 package、模板、静态资源、pkgdata 和扩展库分开判断。源清单发现内部 module、package data 或 native extension 缺失时，先停在 source gate，不重复加载模型。
