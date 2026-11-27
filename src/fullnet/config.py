@@ -10,6 +10,9 @@ import yaml
 
 from .store import inside, name
 
+SUPPORTED_NPU_PLATFORMS = ("a2", "a3", "a5")
+SUPPORTED_PLATFORMS = SUPPORTED_NPU_PLATFORMS + ("cpu-test",)
+
 
 def load(path):
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8-sig"))
@@ -24,10 +27,14 @@ def resolve(path, root):
     if c.get("schema_version") != 1:
         raise ValueError("schema_version must be 1")
     model = name(c.get("model"))
-    if not inside(root, root / "models" / model / "model.yaml").is_file():
+    manifest_path = inside(root, root / "models" / model / "model.yaml")
+    if not manifest_path.is_file():
         raise ValueError("model.yaml is required")
-    if c.get("platform") not in ("a3", "a5", "cpu-test"):
-        raise ValueError("platform must be a3 or a5 (cpu-test is for offline workflow tests)")
+    if c.get("platform") not in SUPPORTED_PLATFORMS:
+        raise ValueError("platform must be a2, a3 or a5 (cpu-test is for offline workflow tests)")
+    manifest = load(manifest_path)
+    if c["platform"] not in manifest.get("platforms", []):
+        raise ValueError(f"platform {c['platform']} is not declared for model {model}")
     service = c.get("service", {})
     argv = service.get("argv")
     if not isinstance(argv, list) or not argv or any(not isinstance(v, str) for v in argv):

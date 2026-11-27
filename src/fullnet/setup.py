@@ -39,7 +39,7 @@ def configure(root, model, platform, python, weights, dataset, metrics, devices,
     target.parent.mkdir(parents=True, exist_ok=True)
     info = model_packages(python)
     model_path = str(Path(weights).resolve())
-    port = 18321 if platform == "a3" else 18322
+    port = {"a2": 18320, "a3": 18321, "a5": 18322}[platform]
     kwargs = {"enable_thinking": False} if manifest.get("family") == "qwen3" else {"thinking": False}
     config = {"schema_version": 1, "model": model, "platform": platform, "devices": devices,
               "identity": {"device_model": "unverified", "model_python": str(python), "packages": info,

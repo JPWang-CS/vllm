@@ -5,12 +5,13 @@ eager, TP1/DP1/PP1) to the deployment-matrix acceptance: profile is collected
 BEFORE performance, and both phases must pass with real device evidence.
 Identity and service argv are frozen exactly as in validate_pangu7b.py.
 """
-import argparse, json, os, re, subprocess, sys
+import argparse, json, os, subprocess, sys
 from pathlib import Path
 from fullnet.analysis import report
 from fullnet.execution import plan, run_experiment
 from fullnet.export import export_run
 from fullnet.measurements import collect_performance, collect_profile
+from fullnet.pangu7b_device_guard import configure_pangu7b_platform_env, verify_npu_smi_output
 from fullnet.store import read_json, rows, write_json
 
 WORKLOADS = [
@@ -38,15 +39,18 @@ def main():
     p.add_argument("--runtime-root", type=Path, required=True)
     p.add_argument("--model-python", type=Path, required=True)
     p.add_argument("--weights", type=Path, required=True)
-    p.add_argument("--platform", choices=("a3", "a5"), required=True)
+    p.add_argument("--platform", choices=("a2", "a3", "a5"), required=True)
     p.add_argument("--device-index", type=int, required=True)
     p.add_argument("--npu-id", type=int, required=True)
     p.add_argument("--task", required=True)
-    p.add_argument("--port", type=int, default=18321)
+    p.add_argument("--port", type=int, default=None)
     p.add_argument("--dataset", type=Path, help="Reuse previously frozen 48-sample subset")
     p.add_argument("--keep-ready", action="store_true")
     p.add_argument("--quality-only", action="store_true", help="Run fixed 48-sample functional/accuracy stage only")
     a = p.parse_args()
+    if a.port is None:
+        # Preserve the historical a3/a5 default while giving A2 its own local endpoint.
+        a.port = 18320 if a.platform == "a2" else 18321
     root = a.project.resolve(strict=True)
     task = (root / "runs" / a.task).resolve(strict=True)
     if not task.is_relative_to(root):
@@ -86,8 +90,7 @@ def main():
                ASCEND_RT_VISIBLE_DEVICES=str(a.device_index), ASCEND_VISIBLE_DEVICES=str(a.device_index),
                VLLM_USE_V1="1", VLLM_WORKER_MULTIPROC_METHOD="spawn", VLLM_PLUGINS="omni-npu,omni_custom_models,omni_npu_patches",
                GLOO_SOCKET_IFNAME="lo", HCCL_SOCKET_IFNAME="lo")
-    if a.platform == "a5":
-        env["ASCEND_COMPUTE_UNIT"] = "ascend950"
+    env = configure_pangu7b_platform_env(env, a.platform)
     # vLLM attaches /start_profile routes only when ProfilerConfig.profiler is
     # set, and its config validator auto-enables profiler='torch' exactly when
     # VLLM_TORCH_PROFILER_DIR is present (run -7b03: 404 without it). Same four
@@ -115,10 +118,9 @@ def main():
     def guard(label):
         r = subprocess.run([str(root / "tools/npu-smi"), "info"], env=env, capture_output=True, text=True, timeout=30)
         (task / (label + ".txt")).write_text(r.stdout + r.stderr)
-        if r.returncode or not re.search(r"\|\s*" + str(a.npu_id) + r"\s+\|?\s*Ascend\w*\s*\|\s*OK\b", r.stdout):
-            raise RuntimeError("target device health unconfirmed")
-        if "No running processes found in NPU " + str(a.npu_id) + " " not in r.stdout:
-            raise RuntimeError("target device is occupied")
+        if r.returncode:
+            raise RuntimeError("target device health unconfirmed: npu-smi failed")
+        verify_npu_smi_output(r.stdout, a.platform, a.npu_id)
 
     status = {"model": "pangu-7b", "platform": a.platform, "model_requests": "not_run",
               "profile": "not_run", "performance": "not_run", "quality_only": a.quality_only,

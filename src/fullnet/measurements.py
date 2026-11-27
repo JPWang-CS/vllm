@@ -1,5 +1,5 @@
 """Official service benchmark and server-side NPU profiling after quality requests."""
-import csv,io,json,os,re,shutil,sqlite3,stat,subprocess,threading,time,urllib.request
+import csv,io,json,math,os,re,shutil,sqlite3,stat,subprocess,threading,time,urllib.request
 from pathlib import Path
 from .execution import private_environment
 from .store import state,read_json,write_json
@@ -37,14 +37,18 @@ def msprof_shadow_toolkit(home,run,owner_uid=None):
     bin_src=src/'bin/msprof';bin_dst=shadow/'tools/profiler/bin/msprof'
     try:
         if not bin_src.is_file():return {'shadow':None,'reason':'msprof binary missing'}
-        if bin_src.is_symlink() or (src/'tools/profiler').is_symlink():
-            return {'shadow':None,'reason':'toolkit entry is a symlink; source remains read-only'}
+        for entry in (bin_src, src/'tools/profiler'):
+            if not entry.resolve(strict=True).is_relative_to(src):
+                return {'shadow':None,'reason':'toolkit entry resolves outside selected SDK'}
+        for entry in (src/'tools/profiler').rglob('*'):
+            if entry.is_symlink() and not entry.resolve(strict=True).is_relative_to(src):
+                return {'shadow':None,'reason':'profiler dependency resolves outside selected SDK'}
         if shadow.exists():
             if shadow.is_symlink() or not shadow.resolve(strict=True).is_relative_to(run):
                 return {'shadow':None,'reason':'shadow path escapes the experiment run'}
             shutil.rmtree(shadow)
         shadow.mkdir(parents=True,exist_ok=True)
-        shutil.copytree(src/'tools/profiler',shadow/'tools/profiler',symlinks=True)
+        shutil.copytree(src/'tools/profiler',shadow/'tools/profiler',symlinks=False)
         bin_dst.parent.mkdir(parents=True,exist_ok=True)
         shutil.copy2(bin_src,bin_dst)
         owner=None
@@ -66,7 +70,65 @@ def msprof_shadow_toolkit(home,run,owner_uid=None):
         return {'shadow':None,'error':type(exc).__name__+': '+str(exc)[:200]}
 
 
-def prepare_profiler_tools(run,c):
+def profile_requested(c):
+    argv=c.get('service',{}).get('argv',[])
+    return bool(c.get('env',{}).get('VLLM_TORCH_PROFILER_DIR') or any(
+        value=='--profiler-config' or str(value).startswith('--profiler-config=') for value in argv))
+
+
+def _profile_recovery():
+    import importlib.util
+    path=Path(__file__).resolve().parents[2]/'.agents/skills/fullnet-profile/scripts/profile_recovery.py'
+    spec=importlib.util.spec_from_file_location('fullnet_profile_recovery',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module
+
+
+def _parser_prelaunch(run,c,record,launch_env):
+    """Actual Python/SQLite/CLI checks, in the environment handed to the service."""
+    helper=_profile_recovery();out=run/'performance'/'parser-prelaunch';out.mkdir(parents=True,exist_ok=True)
+    env=dict(os.environ if launch_env is None else launch_env)
+    if launch_env is None:env.update(c.get('env',{}))
+    env.update(record.get('env_updates') or {})
+    # A direct preparation caller also keeps HOME/cache/temp inside its run.
+    if launch_env is None:
+        for key,folder in [('HOME','home'),('TMPDIR','tmp'),('TMP','tmp'),('TEMP','tmp'),('XDG_CACHE_HOME','cache')]:
+            target=out/folder;target.mkdir(exist_ok=True);env[key]=str(target)
+    python=c['service']['argv'][0]
+    home=env.get('ASCEND_HOME_PATH') or env.get('ASCEND_TOOLKIT_HOME') or record.get('home')
+    entry=(record.get('shadow_toolkit') or {}).get('msprof_py')
+    if not entry and home:entry=str(Path(home)/'tools/profiler/profiler_tool/analysis/msprof/msprof.py')
+    record.update(parser_ready=False,parser_entry=entry,parser_python=python)
+    result={'environment':{k:env[k] for k in ('PATH','LD_LIBRARY_PATH','PYTHONPATH','ASCEND_HOME_PATH','HOME','TMPDIR') if k in env},
+            'tool_source':'private_shadow' if (record.get('shadow_toolkit') or {}).get('shadow') else 'selected_official_entry'}
+    try:
+        if not entry or not Path(entry).is_file():raise RuntimeError('official Python parser entry missing')
+        settings=c.get('measurements',{})
+        devices=settings.get('profile_expected_devices',c.get('devices',[]))
+        count=settings.get('profile_expected_profs',len(devices))
+        if (not isinstance(devices,list) or not devices or any(type(d) is not int or d<0 for d in devices)
+                or len(set(devices))!=len(devices) or type(count) is not int or count<1):
+            raise ValueError('expected profile rank/device contract is missing or invalid')
+        record['expected_profile_contract']={'profs':count,'devices':[str(d) for d in devices]}
+        # Prove the output is usable before any help/import/model process.
+        with (out/'write-probe').open('x') as stream:stream.write('parser-output-writable')
+        (out/'write-probe').unlink()
+        result['sqlite']=helper.parser_dependency_preflight(python,env,run,out/'sqlite',30)
+        if not result['sqlite']['passed']:raise RuntimeError(result['sqlite'].get('first_error','SQLite probe failed'))
+        for name,args in [('cli',[]),('import',['import']),('summary',['export','summary']),('timeline',['export','timeline'])]:
+            result[name]=helper.run_command([python,'-B',entry,*args,'--help'],env,run,out/(name+'-help'),60)
+            text=(out/(name+'-help.stdout')).read_text(errors='replace')
+            if not result[name]['passed'] or name!='cli' and '--collection-dir' not in text:
+                raise RuntimeError('official parser CLI family probe failed: '+name)
+        record['parser_ready']=True
+    except (OSError,RuntimeError,ValueError) as exc:
+        result['error']=f'{type(exc).__name__}: {exc}'
+    record['parser_preflight']=result
+    write_json(run/'performance/profiler-tools.json',record)
+    if not record['parser_ready']:raise RuntimeError('profiler parser prelaunch failed: '+result['error'])
+
+
+def prepare_profiler_tools(run,c,*,launch_env=None):
     """Prepare the msprof analysis toolchain BEFORE the service launches.
 
     The service spawns its profiler children only when start_profile is
@@ -78,12 +140,14 @@ def prepare_profiler_tools(run,c):
     record; run_experiment merges record['env_updates'] into the Popen env.
     """
     run=Path(run).resolve(strict=True);out=run/'performance';out.mkdir(exist_ok=True)
-    home=os.environ.get('ASCEND_HOME_PATH') or os.environ.get('ASCEND_TOOLKIT_HOME')
+    selected_env=launch_env if launch_env is not None else {**os.environ,**c.get('env',{})}
+    home=selected_env.get('ASCEND_HOME_PATH') or selected_env.get('ASCEND_TOOLKIT_HOME')
     if os.name != 'posix':
         record={'home':home,'service_euid':None,'real_msprof_uid':None,
                 'inspection':ensure_msprof_tool_owner(),'prepared_before_launch':True,
                 'shadow_toolkit':{'shadow':None,'reason':'POSIX profiler ownership is not applicable'},
                 'env_updates':{}}
+        if profile_requested(c):_parser_prelaunch(run,c,record,launch_env)
         write_json(out/'profiler-tools.json',record)
         return record
     getuid=getattr(os,'getuid',lambda:None);geteuid=getattr(os,'geteuid',lambda:None)
@@ -112,6 +176,7 @@ def prepare_profiler_tools(run,c):
         updates['PATH']=str(shadow/'tools/profiler/bin')+os.pathsep+os.environ.get('PATH','')
         updates['LD_LIBRARY_PATH']=str(lib)+os.pathsep+os.environ.get('LD_LIBRARY_PATH','')
     record['env_updates']=updates
+    if profile_requested(c):_parser_prelaunch(run,c,record,launch_env)
     write_json(out/'profiler-tools.json',record)
     return record
 
@@ -167,61 +232,97 @@ def verify_profiler_tools(run,c):
 
 
 def _trace_device_kernel_events(path):
+    import math
+    from .profile_trace import iter_trace_events
+
+    def norm(value):
+        return re.sub(r'[^A-Z0-9]', '', str(value or '').upper())
+
+    compute_types={'AICORE','AIVECTORCORE','MIXAIC','MIXAIV','AIC','AIV','AIVECTOR',
+                   'KERNELAIC','KERNELAIVEC','KERNELMIXAIC','KERNELMIXAI','KERNELMIXAIV'}
+    excluded=('CPU','AICPU','HCCL','COMMUNICATION','MEMCPY','SDMA','HOST')
+
+    def has_device_metadata(args, metadata):
+        for key,value in args.items():
+            if norm(key) in {'DEVICEID','DEVICE','NPUID','NPU'} and str(value).strip().isdigit():
+                return True
+        return bool(re.search(r'(?i)\b(?:device(?:\s*id)?|npu)\D{0,8}\d+\b', metadata))
+
+    process_names={};lanes={};process_metadata={}
     try:
-        data=json.loads(path.read_text(encoding='utf-8'))
+        for event in iter_trace_events(path):
+            if not isinstance(event,dict) or event.get('ph')!='M':continue
+            args=event.get('args') or {}
+            if not isinstance(args,dict):continue
+            metadata=' '.join(f'{k}={v}' for k,v in args.items())
+            if event.get('name') in ('process_name','process_labels'):
+                pid=event.get('pid');process_names[pid]=str(args.get('name',''))
+                record=process_metadata.setdefault(pid,{})
+                direct=next((str(v).strip() for k,v in args.items()
+                             if norm(k) in {'DEVICEID','DEVICE','NPUID','NPU'} and str(v).strip().isdigit()),None)
+                match=re.search(r'(?i)\b(?:device(?:\s*id)?|npu)\D{0,8}\d+\b',metadata)
+                if direct is not None:record['device']=direct
+                elif match and 'device' not in record:record['device']=re.search(r'\d+',match.group()).group()
+                record['metadata']=metadata
+            elif event.get('name')=='thread_name':
+                lanes[(event.get('pid'),event.get('tid'))]=str(args.get('name',''))
+        count=0
+        for event in iter_trace_events(path):
+            if not isinstance(event,dict) or event.get('ph')!='X' or not event.get('name'):continue
+            cat=str(event.get('cat',''));name=str(event.get('name',''))
+            args=event.get('args') or {}
+            if not isinstance(args,dict):args={}
+            pid=event.get('pid');process=str(process_names.get(pid,''))
+            metadata=str((process_metadata.get(pid) or {}).get('metadata',''))
+            lane=str(lanes.get((pid,event.get('tid')),''))
+            try:duration=float(event.get('dur',event.get('duration',0)))
+            except (TypeError,ValueError):continue
+            if not math.isfinite(duration) or duration<=0:continue
+            task_values=[str(v) for k,v in args.items() if 'TASKTYPE' in norm(k) or norm(k) in {'KERNELTYPE','TASK'}]
+            task_compute=any(norm(value) in compute_types for value in task_values)
+            cat_compute=norm(cat) in {'AICORE','AIVECTOR','AIC','AIV'}
+            lane_compute=norm(lane) in compute_types
+            text=' '.join(norm(value) for value in (cat,name,process,metadata,lane,*task_values))
+            if any(tag in text for tag in excluded):continue
+            device_bound=has_device_metadata(args,metadata)
+            if device_bound and (task_compute or cat_compute or lane_compute):
+                count+=1
+        return count
     except (OSError,ValueError,UnicodeError):
         return 0
-    events=data.get('traceEvents',data.get('events',[])) if isinstance(data,dict) else data
-    if not isinstance(events,list):return 0
-    process_names={}
-    for event in events:
-        if isinstance(event,dict) and event.get('name') in ('process_name','process_labels'):
-            args=event.get('args') or {};process_names[event.get('pid')]=str(args.get('name',''))
-    count=0
-    for event in events:
-        if not isinstance(event,dict) or not event.get('name'):continue
-        cat=str(event.get('cat','')).lower();name=str(event.get('name','')).lower()
-        args=event.get('args') or {};process=str(process_names.get(event.get('pid'),'' )).lower()
-        if 'cpu' in cat:continue
-        try:duration=float(event.get('dur',event.get('duration',0)))
-        except (TypeError,ValueError):continue
-        if duration<=0:continue
-        task_values=' '.join(str(v).upper() for k,v in args.items() if 'task' in str(k).lower() or 'type' in str(k).lower())
-        task_device=any(tag in task_values for tag in ('AI_CORE','AICORE','AIVEC','AI_VEC','AI_CUBE','AICUBE'))
-        keys={str(k).strip().lower().replace(' ','_') for k in args}
-        device_id=any(k in keys for k in ('device_id','deviceid','device'))
-        process_device=any(tag in process for tag in ('ascend hardware','ascend device','device'))
-        structural_device=task_device or device_id or process_device
-        if not structural_device:continue
-        kernel='kernel' in cat or 'kernel' in name or any(tag in cat for tag in ('device','npu','ascend hardware','aicore','aiv'))
-        if kernel:count+=1
-    return count
 
 
 def _csv_device_kernel_rows(path):
+    import math
+
+    def norm(value):
+        return re.sub(r'[^A-Z0-9]', '', str(value or '').upper())
+
+    compute_types={'AICORE','AIVECTORCORE','MIXAIC','MIXAIV','AIC','AIV','AIVECTOR',
+                   'KERNELAIC','KERNELAIVEC','KERNELMIXAIC','KERNELMIXAI','KERNELMIXAIV'}
+    excluded=('CPU','AICPU','HCCL','COMMUNICATION','MEMCPY','SDMA','HOST')
     count=0
     try:
         with path.open('r',encoding='utf-8-sig',newline='',errors='replace') as stream:
             reader=csv.DictReader(stream)
             if not reader.fieldnames:return 0
-            fields={str(k).strip().lower().replace(' ','_'):k for k in reader.fieldnames}
-            kernel_key=next((v for k,v in fields.items() if 'kernel' in k or k in ('op_name','task_name','name')),None)
-            duration_key=next((v for k,v in fields.items() if 'duration' in k or 'execution_time' in k),None)
-            task_key=next((v for k,v in fields.items() if 'task_type' in k or 'tasktype' in k
-                           or k in ('accelerator_core','accelerator_type','core_type','type')),None)
-            device_key=next((v for k,v in fields.items() if k in ('device_id','deviceid','device')),None)
-            if not duration_key or not (task_key or device_key):return 0
+            fields={norm(k):k for k in reader.fieldnames}
+            kernel_key=next((v for k,v in fields.items() if 'KERNEL' in k or k in ('OPNAME','TASKNAME','NAME')),None)
+            duration_key=next((v for k,v in fields.items() if 'DURATION' in k or 'EXECUTIONTIME' in k or 'TASKTIME' in k),None)
+            task_key=next((v for k,v in fields.items() if k in ('TASKTYPE','KERNELTYPE','ACCELERATORCORE',
+                           'ACCELERATORTYPE','CORETYPE','TYPE')),None)
+            device_key=next((v for k,v in fields.items() if k in ('DEVICEID','DEVICE')),None)
+            if not duration_key or not task_key or not device_key:return 0
             for row in reader:
                 kernel=str(row.get(kernel_key,'device-row')).strip() if kernel_key else 'device-row'
                 if not kernel or 'cpu' in kernel.lower():continue
-                task=str(row.get(task_key,'')).upper() if task_key else ''
+                task=str(row.get(task_key,'')).strip()
+                task_norm=norm(task)
                 device=str(row.get(device_key,'')).strip() if device_key else ''
-                if 'AICPU' in task or task in {'CPU','HOST'}:continue
-                if not (any(tag in task for tag in ('AI_CORE','AICORE','AIVEC','AI_VEC','AI_CUBE','AICUBE',
-                                                    'VECTOR_CORE','CUBE')) or device):continue
+                if not device.isdigit() or not task_norm or task_norm in excluded or task_norm not in compute_types:continue
                 try:duration=float(str(row.get(duration_key,'')).replace(',',''))
                 except (TypeError,ValueError):continue
-                if duration>0:count+=1
+                if math.isfinite(duration) and duration>0:count+=1
     except OSError:
         return 0
     return count
@@ -308,57 +409,53 @@ def _capture_parse_evidence(run,out,limit_bytes=65536,max_logs=40,max_dbs=8):
     return evidence
 
 
-def _offline_parse_profiles(run):
-    """Offline msprof import of the captured *_ascend_pt rank trees.
+def _offline_parse_profiles(run, output=None):
+    """Recover saved raw data once, then explicitly verify the rank/device contract.
 
-    Daemonized workers may not run the in-service torch_npu parser because the
-    profiling data cannot be parsed from that process context while the
-    raw device data on disk is valid. msprof import needs a writable
-    collection dir and the captured trees may be owned by the service identity,
-    so each rank tree is copied under performance/parse-offline/ first.
-    CPU-only: no device access, no service interaction; bounded per rank.
+    Re-entry reads the previous receipt; it never replays the model or silently
+    re-exports a completed/failed attempt. A repaired parser can be requested
+    explicitly with a new output path.
     """
-    run=Path(run).resolve(strict=True);out=run/'performance'
-    try:record=read_json(out/'profiler-tools.json')
-    except (OSError,ValueError):return {'skipped':'no profiler-tools.json'}
-    msprof_py=(record.get('shadow_toolkit') or {}).get('msprof_py')
-    if not msprof_py:return {'skipped':'no shadow msprof.py'}
+    from types import SimpleNamespace
+    run=Path(run).resolve(strict=True);out=run/'performance';out.mkdir(exist_ok=True)
+    helper=_profile_recovery()
     try:
-        msprof_path=Path(msprof_py).resolve(strict=True)
-        if not msprof_path.is_relative_to(run) or not msprof_path.is_file():
-            return {'skipped':'shadow msprof.py is outside the experiment run'}
-    except (OSError,RuntimeError):return {'skipped':'no shadow msprof.py'}
-    try:python=read_json(run/'config.json')['service']['argv'][0]
-    except (OSError,ValueError,KeyError):return {'skipped':'no service python'}
-    env={'HOME':str(run/'home'),'ASCEND_HOME_PATH':record.get('home')}
-    env.update(record.get('env_updates') or {})
-    work=out/'parse-offline';work.mkdir(parents=True,exist_ok=True)
-    parsed=[];first_error=None
-    for rank_dir in sorted((run/'profiles').glob('*_ascend_pt')):
-        result=rank_dir.name
-        try:
-            copy=work/rank_dir.name
-            if rank_dir.is_symlink() or not rank_dir.resolve(strict=True).is_relative_to(run):
-                raise ValueError('profile rank tree escapes the experiment run')
-            if copy.exists():
-                if copy.is_symlink() or not copy.resolve(strict=True).is_relative_to(run):
-                    raise ValueError('offline parse copy escapes the experiment run')
-            else:shutil.copytree(rank_dir,copy,symlinks=True)
-            prof=next(iter(sorted(copy.glob('PROF_*'))))
-            completed=subprocess.run([python,'-B',str(msprof_path),'import','-dir',str(prof)],
-                                     cwd=work,capture_output=True,text=True,timeout=900)
-            if completed.returncode:
-                error_text=(completed.stderr or '')+'\n'+(completed.stdout or '')
-                first_error=first_error or _first_error(error_text) or f'command exited {completed.returncode}'
-                result+=f':exit-{completed.returncode}'
-            else:
-                result+=':passed'
-        except (OSError,subprocess.TimeoutExpired,StopIteration,ValueError) as exc:
-            first_error=first_error or f'{type(exc).__name__}: {exc}'
-            result+=':'+type(exc).__name__
-        parsed.append(result)
-    return {'workdir':str(work),'ranks':parsed,'first_error':first_error,
-            'acceptance':'parsed' if parsed and not first_error else 'not_accepted'}
+        record=read_json(out/'profiler-tools.json');c=read_json(run/'config.json')
+        settings=c.get('measurements',{})
+        devices=[str(d) for d in settings.get('profile_expected_devices',c.get('devices',[]))]
+        count=settings.get('profile_expected_profs',len(devices))
+        if type(count) is not int or count<1 or not devices or len(set(devices))!=len(devices):
+            raise ValueError('profile requires an explicit nonempty expected rank/device contract')
+        existing=sorted(p.parent for p in out.glob('parse-offline-*/RECOVERY.json'))
+        reused=output is None and bool(existing)
+        work=existing[-1] if reused else Path(output) if output is not None else out/'parse-offline-01'
+        work=work.resolve()
+        if not work.is_relative_to(out.resolve()):raise ValueError('recovery output escapes performance directory')
+        if reused:
+            exported=read_json(work/'RECOVERY.json')
+        else:
+            entry=record.get('parser_entry') or (record.get('shadow_toolkit') or {}).get('msprof_py')
+            home=record.get('home')
+            if not entry and home:entry=str(Path(home)/'tools/profiler/profiler_tool/analysis/msprof/msprof.py')
+            if not entry:raise ValueError('no official parser entry')
+            env=dict(os.environ);env.update(c.get('env',{}));env.update(record.get('env_updates') or {})
+            exported=helper.export(SimpleNamespace(source=run/'profiles',output=work,
+                cann_root=Path(home),entry=Path(entry),python=c['service']['argv'][0],
+                library_dir=[],timeout=settings.get('profile_parser_timeout',900),env=env))
+        accepted=helper.verify_exports(work,count,devices) if exported.get('status')=='EXPORTED' else {'status':'FAIL'}
+        write_json(work/'FINAL_ACCEPTANCE.json',accepted)
+        errors=[]
+        for path in sorted(work.glob('rank-*/*.stderr')):
+            text=path.read_text(errors='replace')
+            if text.strip():errors.append(_first_error(text))
+        first=exported.get('first_error') or next((e for e in errors if e),None)
+        passed=accepted.get('status')=='PASS'
+        return {'workdir':str(work),'ranks':exported.get('ranks',[]),'verify':accepted,
+                'acceptance':'passed' if passed else 'not_accepted',
+                'reused_existing':reused,'first_error':None if passed else first or 'offline export/verify failed'}
+    except (OSError,ValueError,RuntimeError,KeyError) as exc:
+        return {'acceptance':'not_accepted','first_error':f'{type(exc).__name__}: {exc}',
+                'workdir':str(work) if 'work' in locals() else None,'ranks':[]}
 
 
 def _first_error(text):
@@ -369,19 +466,56 @@ def _first_error(text):
     return next((line.strip()[:500] for line in str(text).splitlines() if line.strip()),None)
 
 
+def _verify_captured_profile_contract(run,c):
+    """A substantive index alone cannot prove that every captured rank exported."""
+    helper=_profile_recovery();settings=c.get('measurements',{})
+    expected={str(v) for v in settings.get('profile_expected_devices',c.get('devices',[]))}
+    count=settings.get('profile_expected_profs',len(expected));ranks=[];observed=set()
+    for raw in helper.raw_inventory(Path(run)/'profiles'):
+        prof=Path(raw['path']);devices={d['name'].removeprefix('device_') for d in raw['devices'] if d['nonempty_files']}
+        observed.update(devices);metadata=set();errors=[]
+        for device in sorted(devices):
+            try:
+                info=read_json(prof/f'device_{device}'/f'info.json.{device}')
+                metadata.update(str(v['id']) for v in info['DeviceInfo'])
+            except (OSError,ValueError,KeyError,TypeError) as exc:errors.append(str(exc))
+        # torch_npu also places exports beside its single PROF, not inside it.
+        base=prof.parent if len(list(prof.parent.glob('PROF_*')))==1 else prof
+        evidence=helper.inspect(base,next(iter(devices)) if len(devices)==1 else None)
+        csv_devices={d for item in evidence['csv'] for d in item['devices']}
+        trace_devices={d for item in evidence['timelines'] for d in item['devices']}
+        passed=(bool(devices) and devices==metadata==csv_devices==trace_devices and not errors
+                and not evidence['parse_errors'] and evidence['csv_compute_rows']>0
+                and evidence['csv_compute_rows']==evidence['timeline_compute_events'])
+        ranks.append({'prof':str(prof),'devices':sorted(devices),'passed':passed,'metadata_errors':errors,'evidence':evidence})
+    passed=bool(expected) and len(ranks)==count and observed==expected and all(r['passed'] for r in ranks)
+    return {'status':'PASS' if passed else 'FAIL','expected_profs':count,'expected_devices':sorted(expected),
+            'observed_profs':len(ranks),'observed_devices':sorted(observed),'ranks':ranks}
+
+
 def profile_artifact_index(run,extra_dirs=()):
-    root=Path(run);profiles=root/'profiles';items=[]
-    candidates=[]
-    if profiles.exists():
-        candidates.extend((p,'kernel_csv') for p in profiles.rglob('*')
-                          if p.is_file() and p.suffix.lower()=='.csv' and
-                          (p.name.lower() in {'device.csv','device_details.csv','kernel_details.csv'} or
-                           p.name.lower().startswith(('op_summary','ascend_op_summary'))))
-        candidates.extend((p,'trace') for p in profiles.rglob('trace_view.json'))
+    root=Path(run);profiles=root/'profiles';items=[];candidates=[];seen=set()
+    def add_candidate(path,kind):
+        try:resolved=path.resolve(strict=True)
+        except (OSError,RuntimeError):return
+        key=str(resolved)
+        if key not in seen:
+            seen.add(key);candidates.append((resolved,kind))
+    def scan(base,all_csv=False):
+        for path in base.rglob('*'):
+            if not path.is_file():continue
+            name=path.name.lower()
+            if path.suffix.lower()=='.csv' and (all_csv or name in {'device.csv','device_details.csv','kernel_details.csv'}
+                                                or name.startswith(('op_summary','ascend_op_summary'))):
+                add_candidate(path,'kernel_csv')
+            elif name=='trace_view.json' or (name.startswith('msprof_') and name.endswith('.json')) \
+                    or name.endswith('.pt.trace.json.gz'):
+                add_candidate(path,'trace')
+    if profiles.exists():scan(profiles)
     for extra in extra_dirs:
         extra=Path(extra)
-        if extra.exists():
-            candidates.extend((p,'kernel_csv') for p in extra.rglob('*.csv'))
+        if extra.exists():scan(extra,all_csv=True)
+    candidates.sort(key=lambda item:(item[1]!='kernel_csv',str(item[0])))
     for path,kind in candidates:
         exists=path.is_file();size=path.stat().st_size if exists else 0
         events=kernels=0;notes=[]
@@ -523,7 +657,9 @@ def collect_profile(run,c):
             if profile_error is None:profile_error=exc
         write_json(out/'profile-parse-evidence.json',_capture_parse_evidence(run,out))
         index=profile_artifact_index(run)
-        if not index['has_device_kernel_evidence']:
+        direct=_verify_captured_profile_contract(run,c)
+        write_json(out/'profile-direct-verify.json',direct)
+        if direct['status']!='PASS':
             # Daemon-mode DP workers cannot run the in-service torch_npu parser
             # parse the captured *_ascend_pt trees offline instead of
             # failing with zero artifacts while valid device data is on disk.
@@ -531,6 +667,8 @@ def collect_profile(run,c):
             write_json(out/'profile-offline-parse.json',offline)
             extras=[Path(offline['workdir'])] if offline.get('workdir') else []
             index=profile_artifact_index(run,extra_dirs=extras)
+            if offline.get('acceptance')!='passed' and profile_error is None:
+                profile_error=RuntimeError('offline profile export/verify failed: '+str(offline.get('first_error')))
         write_json(out/'profile-artifacts.json',index)
     if profile_error is not None:
         state(run,'profile','failed',error=type(profile_error).__name__,detail=str(profile_error)[:1000],
@@ -649,20 +787,30 @@ def pd_mixed_probe(run,c):
     return result
 
 
+def _pd_metric_kind(name):
+    label=str(name).split('{',1)[0].lower()
+    if re.search(r'(?:^|:)kv_(?:(?:pull|push|transfer)_(?:success|completed)(?:_(?:bytes|blocks|requests))?|transfer_(?:bytes|blocks))_total$',label):
+        return 'completion'
+    if label.endswith('_total') and re.search(r'(?:^|:)kv_(?:transfer|pull|push|link|load|recompute|fallback)_',label) \
+            and any(tag in label for tag in ('fail','error','timeout','reject','recomput','fallback')):
+        return 'failure'
+    return None
+
+
 def _kv_metric_deltas(before,after):
     """Prometheus-style kv counter deltas from /metrics_snapshot bodies."""
     def counters(text):
         values={}
         for line in text.splitlines():
             fields=line.split()
-            if len(fields)==2 and 'kv' in fields[0].lower():
+            if len(fields)==2 and _pd_metric_kind(fields[0]) is not None:
                 try:values[fields[0]]=float(fields[1])
                 except ValueError:pass
         return values
     deltas={}
     for role in ('producer','consumer'):
         b,a=counters(before.get(role,'')),counters(after.get(role,''))
-        deltas[role]={name:a[name]-b[name] for name in a if name in b and a[name]!=b[name]}
+        deltas[role]={name:a[name]-b.get(name,0) for name in a if a[name]!=b.get(name,0)}
     return deltas
 
 
@@ -682,18 +830,299 @@ def _connector_log_evidence(log_path):
 
 def _has_positive_kv_metric(values):
     for name,value in values.items():
-        label=str(name).lower()
-        if value>0 and any(tag in label for tag in ('byte','block','success','transfer','pull','push')) \
-                and not any(tag in label for tag in ('fail','error','timeout','reject')):
+        # Transfer-specific counters only: memory bytes, prefill/recompute
+        # histograms and failure counters do not prove a completed transfer.
+        if math.isfinite(value) and value>0 and _pd_metric_kind(name)=='completion':
             return True
     return False
 
 
 def _has_kv_transfer_log(lines):
-    return any(any(tag in line.lower() for tag in ('pull_block','pull_done','push_block',
-                                                    'push_done','kv_transfer','transfer_done'))
-               and not any(tag in line.lower() for tag in ('fail','error','timeout','reject'))
+    # Bare pull_done is also emitted on failure by this runtime. Require an
+    # explicit successful completion; config/factory/register/submit is not one.
+    return any(re.search(r'\b(?:pull_done|push_done|transfer_done|kv_pull_completed|kv_transfer_completed)\b',line.lower())
+               and re.search(r'\b(?:success=true|status=success)\b',line.lower())
+               and not any(tag in line.lower() for tag in ('fail','error','timeout','reject','register','factory','submit'))
                for line in lines)
+
+
+def _pd_log_failure(line):
+    lower=line.lower()
+    if any(tag in lower for tag in ('llm_link_failed','link failed','link fail:',
+                                     'kv load failure','kv load failed','err pull blocks',
+                                     'err pull_blocks','err send pull done','err in task_pull_kv')):
+        return True
+    if ('kv' in lower or 'cache' in lower) and any(tag in lower for tag in ('recomput','fallback','rescheduled')):
+        return True
+    match=re.search(r'\bfail_pull\s*[:=]\s*(\d+(?:\.\d*)?(?:e[+\-]?\d+)?)',lower)
+    return bool(match and float(match.group(1))>0)
+
+
+def _pd_log_window(path,start):
+    """Scan only appended bytes; retain bounded evidence but count every failure."""
+    activity=[];failures=[];count=0
+    try:
+        with Path(path).open('rb') as stream:
+            info=os.fstat(stream.fileno())
+            if (start is not None and (info.st_dev,info.st_ino)!=tuple(start['identity'])) or info.st_size<(start or {}).get('offset',0):
+                return {'activity':[], 'failure_count':0,'failure_lines':[], 'invalid_window':'log rotated or truncated'}
+            offset=(start or {}).get('offset',0);stream.seek(offset)
+            for raw in stream:
+                line=raw.decode('utf-8',errors='replace').strip()
+                if _pd_log_failure(line):
+                    count+=1
+                    if len(failures)<12:failures.append(line[:600])
+                if any(tag in line.lower() for tag in ('llmdatadist','pull_block','pull_done','push_block','push_done','transfer_done','kv_transfer')):
+                    activity.append(line[:600]);activity=activity[-12:]
+            return {'activity':activity,'failure_count':count,'failure_lines':failures,
+                    'offset_start':offset,'offset_end':stream.tell(),'identity':[info.st_dev,info.st_ino]}
+    except OSError as exc:
+        return {'activity':[],'failure_count':0,'failure_lines':[],'invalid_window':str(exc)}
+
+
+def _pd_failure_reasons(deltas,windows):
+    reasons=[]
+    for role in ('producer','consumer'):
+        for name,value in deltas[role].items():
+            if not math.isfinite(value) or value<0:
+                reasons.append(f'{role} KV counter nonfinite or reset: {name}')
+            elif value>0 and any(tag in name.lower() for tag in ('fail','error','timeout','reject','recomput','fallback')):
+                reasons.append(f'{role} KV failure counter increased: {name} (+{value})')
+        window=windows[role]
+        if window.get('invalid_window'):reasons.append(f'{role} log window invalid: '+window['invalid_window'])
+        if window['failure_count']:reasons.append(f'{role} new KV link/pull/recompute failure log lines: {window["failure_count"]}')
+    return reasons
+
+
+PREFILL_REQUEST_ID_HEADER = 'X-Fullnet-Prefill-Request-Id'
+PREFILL_ACK_ENDPOINT_HEADER = 'X-Fullnet-Prefill-Ack-Endpoint'
+_PD_OBSERVER_COUNTERS = {'consumer':'kv_pull_completed_requests_total',
+                         'producer':'kv_producer_done_ack_total'}
+
+
+def _pd_observer_parser():
+    # Default/legacy probes never import this optional dependency.
+    try:
+        from prometheus_client.parser import text_string_to_metric_families
+    except ImportError as exc:
+        raise RuntimeError("observer mode requires fullnet[metrics]; install this checkout with "
+                           "python -m pip install -e '.[metrics]'") from exc
+    return text_string_to_metric_families
+
+
+def _pd_observer_counters(text,parser):
+    if not isinstance(text,str):raise ValueError('metrics body must be text')
+    values={}
+    for family in parser(text):
+        for sample in family.samples:
+            if sample.name not in _PD_OBSERVER_COUNTERS.values() and _pd_metric_kind(sample.name)!='failure':
+                continue
+            if family.type!='counter':raise ValueError('expected Counter: '+sample.name)
+            key=(sample.name,tuple(sorted(sample.labels.items())))
+            if key in values:raise ValueError('duplicate metric series: '+sample.name)
+            value=float(sample.value)
+            if not math.isfinite(value) or value<0:raise ValueError('nonfinite or negative Counter: '+sample.name)
+            values[key]=value
+    return values
+
+
+def _pd_observer_deltas(before,after):
+    parser=_pd_observer_parser();deltas={};reasons=[]
+    for role in ('producer','consumer'):
+        deltas[role]=[]
+        try:
+            b=_pd_observer_counters(before[role],parser);a=_pd_observer_counters(after[role],parser)
+            if b.keys()-a.keys():raise ValueError('Counter series disappeared')
+            for (name,labels),value in a.items():
+                previous=b.get((name,labels),0);delta=value-previous
+                if delta<0:raise ValueError('Counter reset: '+name)
+                deltas[role].append({'name':name,'labels':dict(labels),'before':previous,'delta':delta})
+                if _pd_metric_kind(name)=='failure' and delta>0:
+                    reasons.append(f'{role} KV failure counter increased: {name} (+{delta})')
+        except (KeyError,TypeError,ValueError) as exc:
+            reasons.append(f'{role} invalid observer metrics: {exc}')
+    return deltas,reasons
+
+
+def _pd_ack_endpoint(value,*,runtime=False):
+    """Validate an ASCII TCP authority; never infer a port or resolve a host."""
+    if not isinstance(value,str) or len(value)>512 or not value.isascii():
+        raise ValueError('ack endpoint must be a bounded ASCII TCP endpoint')
+    if runtime and not value.startswith('tcp://'):
+        raise ValueError('runtime ack endpoint must use tcp://')
+    authority=value.removeprefix('tcp://')
+    match=re.fullmatch(r'(?:\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?):([0-9]{1,5})',authority)
+    if not match or not 1<=int(match.group(1))<=65535:
+        raise ValueError('invalid ack host:port (no whitespace, URL path or userinfo allowed)')
+    host=authority[:authority.rfind(':')]
+    if host.startswith('[') or re.fullmatch(r'[0-9.]+',host):
+        import ipaddress
+        ipaddress.ip_address(host.strip('[]'))
+    elif any(not re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?',part) for part in host.split('.')):
+        raise ValueError('invalid ack hostname')
+    return authority
+
+
+def _pd_handoff_headers(headers):
+    """HTTPMessage.get_all preserves duplicate headers, unlike .get()."""
+    result={}
+    for name in (PREFILL_REQUEST_ID_HEADER,PREFILL_ACK_ENDPOINT_HEADER):
+        values=headers.get_all(name,[]) if hasattr(headers,'get_all') else ([headers[name]] if name in headers else [])
+        result[name]=values
+    return result
+
+
+def pd_observer_request_evidence(before,after,*,prefill_req_id,ack_endpoint,ack_addr=None):
+    """Join one relay request to real consumer completion and producer ack.
+
+    parts=1 only. An ack is not a push/copy proof. This pure join alone does
+    not cover transient link failures or recompute; the probe also needs full
+    bounded log windows. Labels are decoded by the official Prometheus parser.
+    """
+    deltas,reasons=_pd_observer_deltas(before,after)
+    if (not isinstance(prefill_req_id,str) or not prefill_req_id or prefill_req_id!=prefill_req_id.strip()
+            or any(ord(char)<32 or ord(char)==127 for char in prefill_req_id)):
+        reasons.append('missing or invalid relay prefill request ID header')
+    discovered=None
+    try:
+        discovered=_pd_ack_endpoint(ack_endpoint,runtime=True)
+        if ack_addr is not None and _pd_ack_endpoint(ack_addr)!=discovered:
+            reasons.append('runtime handoff ack endpoint differs from configured expected ack_addr')
+    except ValueError as exc:reasons.append(str(exc))
+    labels={'prefill_req_id':prefill_req_id,'parts':'1',
+            'ack_addr':discovered}
+    for role,name in _PD_OBSERVER_COUNTERS.items():
+        rows=[row for row in deltas[role] if row['name']==name]
+        matched=[row for row in rows if row['labels']==labels]
+        if len(matched)!=1 or matched[0]['delta']!=1 or matched[0]['before']!=0:
+            reasons.append(f'{role} requires one fresh request-bound {name} increment with parts=1 and matching ack_addr')
+        if any(row['delta']>0 and row['labels']!=labels for row in rows):
+            reasons.append(f'{role} unrelated or mismatched completion in request window')
+    return {'proof_status':'PROVEN' if not reasons else 'NOT_PROVEN','reasons':reasons,
+            'prefill_req_id':prefill_req_id,'handoff_ack_endpoint':ack_endpoint,
+            'configured_ack_addr':ack_addr,'expected_labels':labels,'counter_deltas':deltas}
+
+
+def _pd_observer_snapshot(base,options):
+    urls=options.get('metrics_urls')
+    if urls is None:
+        with urllib.request.urlopen(base+'/metrics_snapshot',timeout=120) as response:
+            if response.status!=200:raise ValueError('metrics_snapshot did not return HTTP 200')
+            raw=response.read(2*1024*1024+1)
+        if len(raw)>2*1024*1024:raise ValueError('metrics snapshot exceeds 2 MiB')
+        data=json.loads(raw)
+    else:
+        if not isinstance(urls,dict) or set(urls)!=set(_PD_OBSERVER_COUNTERS):
+            raise ValueError('metrics_urls requires producer and consumer URLs')
+        data={}
+        for role,url in urls.items():
+            if not isinstance(url,str) or not url.startswith(('http://','https://')):
+                raise ValueError('invalid role metrics URL')
+            with urllib.request.urlopen(url,timeout=120) as response:
+                if response.status!=200:raise ValueError(role+' metrics did not return HTTP 200')
+                raw=response.read(2*1024*1024+1)
+            if len(raw)>2*1024*1024:raise ValueError('role metrics exceeds 2 MiB')
+            data[role]=raw.decode('utf-8')
+    if not isinstance(data,dict) or any(not isinstance(data.get(r),str) for r in _PD_OBSERVER_COUNTERS):
+        raise ValueError('metrics snapshot must contain both role text bodies')
+    return data
+
+
+def _pd_split_observer_probe(run,c,options):
+    """Explicit observer mode; remote-only failure metrics are NOT_PROVEN.
+
+    measurements.pd_split_observer = {enabled: true, ack_source: 'runtime_handoff',
+      failure_evidence: 'local_logs', relay_base_url: 'http://relay:port',
+      metrics_urls: {producer: ..., consumer: ...}}
+    metrics_urls is optional for same-host /metrics_snapshot. relay_base_url
+    bypasses a front that strips response headers; it still calls the real
+    relay, not either model role directly. Complete local
+    producer/consumer logs remain mandatory until remote failure coverage is
+    implemented and independently verified. ack_addr is an optional extra
+    restriction, not a source for discovering the endpoint. Never falls back
+    to legacy proof.
+    """
+    run=Path(run);out=run/'performance';out.mkdir(exist_ok=True)
+    result={'probe':'same_host_pd_split','mode':'observer','proof_status':'NOT_PROVEN',
+            'acceptance':'failed','requests':[],'reasons':[]}
+    reasons=result['reasons'];paths={r:run/'logs'/f'pd-split-{r}.log' for r in _PD_OBSERVER_COUNTERS}
+    starts={};whole_before=None
+    state(run,'pd_split_probe','running')
+    try:
+        _pd_observer_parser()
+        if options.get('failure_evidence')!='local_logs':
+            raise ValueError('NOT_PROVEN: full remote link/pull/recompute failure coverage is not implemented; local_logs required')
+        if options.get('ack_source')!='runtime_handoff':
+            raise ValueError('observer mode requires frozen ack_source=runtime_handoff')
+        if 'ack_addr' in options:_pd_ack_endpoint(options['ack_addr'])
+        if any(type(c.get('identity',{}).get(k)) is not int or c['identity'][k]!=1 for k in ('tp','dp','pp')):
+            raise ValueError('observer mode currently requires explicit TP=DP=PP=1 (parts=1)')
+        for role,path in paths.items():
+            info=path.stat();starts[role]={'identity':[info.st_dev,info.st_ino],'offset':info.st_size}
+        root=run.parents[3];env=_bench_environment(run,c,root)
+        python=c['service']['argv'][0];base=c['service']['base_url'].removesuffix('/v1')
+        relay=options.get('relay_base_url',base)
+        if not isinstance(relay,str) or not relay.startswith(('http://','https://')):
+            raise ValueError('relay_base_url must be the real HTTP relay endpoint')
+        relay=relay.rstrip('/').removesuffix('/v1')
+        kwargs=c['evaluation'].get('chat_template_kwargs',{})
+        whole_before=_pd_observer_snapshot(base,options)
+        for name,input_tokens,output_tokens in [('prefill_heavy',4096,64),('decode_heavy',128,1024)]:
+            folder=out/('pd-split-'+name);folder.mkdir(exist_ok=True)
+            record={'request_class':name,'input_tokens_target':input_tokens,'output_tokens_target':output_tokens}
+            result['requests'].append(record);dataset=folder/'input.jsonl'
+            prepared=subprocess.run([python,'-B',str(root/'scripts/evaluation/prepare_bench_data.py'),
+                '--model',c['identity']['weights'],'--tokens',str(input_tokens),'--output',str(dataset),
+                '--kwargs',json.dumps(kwargs)],cwd=root,env=env,capture_output=True,text=True,timeout=300)
+            (folder/'prepare.stdout').write_text(prepared.stdout,encoding='utf-8')
+            (folder/'prepare.stderr').write_text(prepared.stderr,encoding='utf-8')
+            if prepared.returncode:raise RuntimeError('split probe prompt preparation failed: '+name)
+            prompt=json.loads(dataset.read_text().splitlines()[0])['prompt']
+            before=_pd_observer_snapshot(base,options)
+            write_json(folder/'metrics-before.json',before)
+            body={'model':c['service']['served_model'],'messages':[{'role':'user','content':prompt}],
+                  'max_tokens':output_tokens,'temperature':0,'seed':0,'ignore_eos':True,'chat_template_kwargs':kwargs}
+            request=urllib.request.Request(relay+'/v1/chat/completions',method='POST',data=json.dumps(body).encode(),
+                                           headers={'Content-Type':'application/json'})
+            with urllib.request.urlopen(request,timeout=c['service'].get('request_timeout',300)) as response:
+                raw=response.read(8*1024*1024+1)
+                if len(raw)>8*1024*1024:raise ValueError('probe response exceeds 8 MiB')
+                (folder/'response.json').write_bytes(raw);payload=json.loads(raw)
+                header_values=_pd_handoff_headers(response.headers);record['handoff_headers']=header_values
+                if any(len(values)!=1 for values in header_values.values()):
+                    raise ValueError('missing or duplicate runtime handoff response header')
+                record.update(http_status=response.status,prefill_req_id=header_values[PREFILL_REQUEST_ID_HEADER][0],
+                              ack_endpoint=header_values[PREFILL_ACK_ENDPOINT_HEADER][0],
+                              completion_tokens=payload.get('usage',{}).get('completion_tokens'))
+            after=_pd_observer_snapshot(base,options);write_json(folder/'metrics-after.json',after)
+            proof=pd_observer_request_evidence(before,after,prefill_req_id=record['prefill_req_id'],
+                ack_endpoint=record['ack_endpoint'],ack_addr=options.get('ack_addr'))
+            record['transfer_evidence']=proof;reasons.extend(proof['reasons'])
+            if record['http_status']!=200 or record['completion_tokens']!=output_tokens:
+                reasons.append('request HTTP status or exact completion token contract failed: '+name)
+            windows={r:_pd_log_window(p,starts[r]) for r,p in paths.items()}
+            reasons.extend(_pd_failure_reasons({r:{} for r in paths},windows))
+            if reasons:break
+    except Exception as exc:
+        reasons.append(f'{type(exc).__name__}: {exc}')
+    finally:
+        if whole_before is not None:
+            try:
+                whole_after=_pd_observer_snapshot(base,options)
+                write_json(out/'pd-observer-window-metrics.json',{'before':whole_before,'after':whole_after})
+                result['window_counter_deltas'],failures=_pd_observer_deltas(whole_before,whole_after)
+                reasons.extend(failures)
+            except Exception as exc:reasons.append('whole-window metrics failed: '+str(exc))
+        if len(starts)==2:
+            result['connector_log_windows']={r:_pd_log_window(p,starts[r]) for r,p in paths.items()}
+            reasons.extend(_pd_failure_reasons({r:{} for r in paths},result['connector_log_windows']))
+    if len(result['requests'])!=2:reasons.append('not every split request proved transfer')
+    result['reasons']=list(dict.fromkeys(reasons))
+    if not reasons:result.update(acceptance='passed',proof_status='PROVEN')
+    write_json(out/'pd-split-probe.json',result)
+    state(run,'pd_split_probe',result['acceptance'],requests=len(result['requests']),reasons=result['reasons'])
+    if reasons:raise RuntimeError('pd split observer probe failed: '+'; '.join(result['reasons']))
+    return result
 
 
 def pd_split_probe(run,c):
@@ -704,8 +1133,15 @@ def pd_split_probe(run,c):
     consumer decodes. Acceptance: both requests complete with exact token
     counts AND kv-transfer activity on each instance (positive kv metric
     deltas on /metrics of both sides, or connector activity lines in both
-    engine logs). Evidence recorded to performance/pd-split-probe.json.
+    engine logs). Any new link/pull failure or recompute fallback vetoes
+    acceptance, including when positive transfer counters also increase.
+    Evidence recorded to performance/pd-split-probe.json.
     """
+    options=c.get('measurements',{}).get('pd_split_observer')
+    if options is not None:
+        if not isinstance(options,dict) or type(options.get('enabled')) is not bool:
+            raise ValueError('pd_split_observer requires an explicit boolean enabled')
+        if options['enabled']:return _pd_split_observer_probe(run,c,options)
     run=Path(run);out=run/'performance';out.mkdir(exist_ok=True)
     root=run.parents[3];env=_bench_environment(run,c,root)
     python=c['service']['argv'][0];base=c['service']['base_url'].removesuffix('/v1')
@@ -714,6 +1150,12 @@ def pd_split_probe(run,c):
     classes=[{'name':'prefill_heavy','input':4096,'output':64},
              {'name':'decode_heavy','input':128,'output':1024}]
     state(run,'pd_split_probe','running')
+    log_paths={role:run/'logs'/('pd-split-%s.log'%role) for role in ('producer','consumer')}
+    log_starts={}
+    for role,path in log_paths.items():
+        try:
+            info=path.stat();log_starts[role]={'identity':[info.st_dev,info.st_ino],'offset':info.st_size}
+        except FileNotFoundError:log_starts[role]=None
     metrics_before=json.loads(urllib.request.urlopen(base+'/metrics_snapshot',timeout=120).read())
     requests=[]
     for spec in classes:
@@ -742,8 +1184,9 @@ def pd_split_probe(run,c):
         requests.append(record)
     metrics_after=json.loads(urllib.request.urlopen(base+'/metrics_snapshot',timeout=120).read())
     deltas=_kv_metric_deltas(metrics_before,metrics_after)
-    logs={role:_connector_log_evidence(run/'logs'/('pd-split-%s.log'%role)) for role in ('producer','consumer')}
-    reasons=[]
+    windows={role:_pd_log_window(path,log_starts[role]) for role,path in log_paths.items()}
+    logs={role:window['activity'] for role,window in windows.items()}
+    reasons=_pd_failure_reasons(deltas,windows)
     if len(requests)!=len(classes):reasons.append('not every split request returned')
     if any(r.get('http_status')!=200 for r in requests):reasons.append('a split request did not return HTTP 200')
     if any(r.get('completion_tokens')!=r.get('output_tokens_target') for r in requests):
@@ -753,7 +1196,8 @@ def pd_split_probe(run,c):
     if not (kv_metrics or kv_logs):
         reasons.append('no kv-transfer activity observed (no kv metric delta on both sides and no connector log lines)')
     result={'probe':'same_host_pd_split','requests':requests,'kv_metric_deltas':deltas,
-            'connector_log_lines':logs,'acceptance':'passed' if not reasons else 'failed','reasons':reasons}
+            'connector_log_lines':logs,'connector_log_windows':windows,
+            'acceptance':'passed' if not reasons else 'failed','reasons':reasons}
     write_json(out/'pd-split-probe.json',result)
     if reasons:
         state(run,'pd_split_probe','failed',reasons=reasons)

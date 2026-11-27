@@ -19,7 +19,7 @@ def main():
     target = (root / a.env).resolve()
     if not target.is_relative_to(root / "envs"):
         raise ValueError("environment must be under this project's envs directory")
-    if a.extras and any(x not in ("test", "download", "evaluation") for x in a.extras.split(",")):
+    if a.extras and any(x not in ("test", "download", "evaluation", "metrics") for x in a.extras.split(",")):
         raise ValueError("unknown extras")
     env = os.environ.copy()
     for key, suffix in {"PIP_CACHE_DIR":"cache/pip", "TMPDIR":"tmp", "TEMP":"tmp", "TMP":"tmp",

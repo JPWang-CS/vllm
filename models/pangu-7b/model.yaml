@@ -3,7 +3,7 @@ name: pangu-7b
 family: pangu
 purpose: 整网启动、固定样本评测和算子替换验证
 weights: 由本机配置指定只读目录
-platforms: [a3, a5]
+platforms: [a2, a3, a5]
 baseline_index: baselines/index.yaml
 download:
   provider: huggingface

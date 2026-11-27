@@ -10,9 +10,11 @@ import argparse
 import os
 import importlib.util
 import json
+import posixpath
 import re
 import shlex
 import time
+import uuid
 from pathlib import Path, PurePosixPath
 
 
@@ -24,8 +26,272 @@ def identifier(value):
 
 PROJECT_COPY_SKIP_DIRS = frozenset({
     "experiments", "__pycache__", "weights", "cache", "envs", "runtime",
-    "assets", "build", "tmp", ".git",
+    "assets", "build", "tmp", ".git", "runs", ".runtime", "secrets",
 })
+FRAMEWORK_SOURCE_SUFFIXES = frozenset({'.py', '.sh', '.md', '.toml', '.json', '.txt', '.yaml', '.yml'})
+FRAMEWORK_SOURCE_ROOTS = ("scripts", "src", "models", ".agents", "requirements")
+FRAMEWORK_SOURCE_RECEIPT = ".runtime/framework-source.json"
+FRAMEWORK_SOURCE_RECEIPT_SCHEMA = 1
+
+
+def published_source_file_allowed(relative):
+    path = PurePosixPath(relative)
+    roots = set(FRAMEWORK_SOURCE_ROOTS) | {'docs', 'tests', 'examples'}
+    root_files = {'AGENTS.md', 'CLAUDE.md', 'README.md', 'STATUS.md', 'LICENSE',
+                  'pyproject.toml', '.gitignore', '.gitattributes'}
+    return (str(path) in root_files or
+            (path.parts and path.parts[0] in roots and
+             (path.suffix in FRAMEWORK_SOURCE_SUFFIXES | {'.png', '.svg', '.jpg', '.jpeg', '.jsonl'})))
+
+
+def bridge_source_snapshot(path=None):
+    """Capture the loaded bridge bytes for freshness checks without hashing."""
+    path = Path(path or __file__).resolve(strict=True)
+    return path, path.read_bytes()
+
+
+def loaded_bridge_matches_disk(path, loaded):
+    """Detect a replaced bridge file without killing the running broker."""
+    try:
+        return Path(path).resolve(strict=True).read_bytes() == loaded
+    except (OSError, ValueError):
+        return False
+
+
+_LOADED_BRIDGE_PATH, _LOADED_BRIDGE_CONTENT = bridge_source_snapshot()
+
+
+def project_workload_processes(project, proc_root='/proc'):
+    """Find actual project workloads, without treating old state files as live."""
+    project = str(PurePosixPath(project)).rstrip('/')
+    active = []
+    for entry in Path(proc_root).iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            argv = (entry / 'cmdline').read_bytes().split(b'\0')
+            args = [v.decode('utf-8', 'replace') for v in argv if v]
+            direct = any(a.startswith(project + '/models/') or
+                         (a.startswith(project + '/runs/') and '/fleet-jobs/' in a)
+                         for a in args)
+            env = (entry / 'environ').read_bytes().split(b'\0')
+            inherited = any(v.startswith(b'FULLNET_RUN=' + project.encode() + b'/models/') for v in env)
+            if direct or inherited:
+                active.append({'pid': int(entry.name), 'executable': Path(args[0]).name if args else 'unknown'})
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            # The container's reviewed update entry executes as its existing
+            # privileged identity; an unreadable process makes the guard unknown.
+            raise RuntimeError('cannot inspect process identity before source update')
+    return {'active': active, 'busy': bool(active)}
+
+
+def broker_heartbeat_compatible(value):
+    """Return true only for a broker that loaded the freshness-aware bridge."""
+    return (isinstance(value, dict)
+            and value.get("framework_source_receipt_schema") == FRAMEWORK_SOURCE_RECEIPT_SCHEMA
+            and value.get("broker_source_file") == "scripts/ops/registered_fleet_bridge.py"
+            and value.get("loaded_source_matches_disk") is True)
+
+
+def framework_source_manifest(root):
+    """List the published framework files and sizes; no hashes or Git metadata."""
+    root = Path(root).resolve(strict=True)
+    files = []
+    for top in FRAMEWORK_SOURCE_ROOTS:
+        directory = root / top
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        for path in sorted(directory.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if any(part in PROJECT_COPY_SKIP_DIRS for part in Path(relative).parts[:-1]):
+                continue
+            size = path.stat().st_size
+            if framework_source_file_allowed(relative, size):
+                files.append({"path": relative, "bytes": size})
+    return files
+
+
+def validate_framework_receipt(receipt, manifest):
+    """Require a published tracked-snapshot receipt, not a branch name alone."""
+    if not isinstance(receipt, dict) or receipt.get("schema") != FRAMEWORK_SOURCE_RECEIPT_SCHEMA:
+        raise ValueError("published framework snapshot receipt is missing or has an unsupported schema")
+    if receipt.get("branch") != "main":
+        raise ValueError("published framework snapshot must declare branch main")
+    files = receipt.get("files")
+    expected = sorted(item["path"] if isinstance(item, dict) else item for item in manifest)
+    actual = sorted(files) if isinstance(files, list) and all(isinstance(item, str) for item in files) else None
+    if not actual or len(actual) != len(set(actual)) or actual != expected or not isinstance(receipt.get("snapshot"), str):
+        raise ValueError("published framework snapshot receipt does not match the source file list")
+    return {"schema": receipt["schema"], "branch": "main",
+            "snapshot": receipt["snapshot"], "files": expected}
+
+
+def remote_regular_source(remote, root, relative):
+    """Check every lexical component before reading a published source file."""
+    import stat
+    path = PurePosixPath(relative)
+    current = PurePosixPath(root)
+    attrs = remote.lstat(str(current))
+    if not stat.S_ISDIR(attrs.st_mode):
+        raise ValueError("source root is not a regular directory")
+    for index, part in enumerate(path.parts):
+        current = current / part
+        attrs = remote.lstat(str(current))
+        expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+        if not expected(attrs.st_mode):
+            raise ValueError("source contains a symlink or nonregular component: " + relative)
+    return attrs
+
+
+def compare_control_to_snapshot(remote, project_root, receipt):
+    """Compare control-project core files with the published snapshot contents."""
+    snapshot = _absolute_posix_path(receipt["snapshot"], "published snapshot")
+    project = _absolute_posix_path(project_root, "control project")
+    runs = project / "runs"
+    if not snapshot.is_relative_to(runs) or snapshot.name != "published":
+        raise ValueError("published snapshot must be project/runs/<publish-task>/published")
+    mismatches = []
+    for relative in receipt["files"]:
+        path = PurePosixPath(relative)
+        if (path.is_absolute() or ".." in path.parts or not path.parts
+                or any(part in PROJECT_COPY_SKIP_DIRS - {"assets", "cache"} for part in path.parts[:-1])
+                or '.local.' in relative
+                or not published_source_file_allowed(relative)):
+            raise ValueError("published snapshot contains an unsupported source path: " + relative)
+        source_path = str(project / path)
+        snapshot_path = str(snapshot / path)
+        try:
+            source_attrs = remote_regular_source(remote, project, relative)
+            snapshot_attrs = remote_regular_source(remote, project, str(PurePosixPath(snapshot).relative_to(project) / path))
+            if source_attrs.st_size > 2_000_000 or snapshot_attrs.st_size > 2_000_000:
+                raise ValueError("published source exceeds the transfer limit: " + relative)
+            with remote.open(source_path, "rb") as source_stream:
+                source_data = source_stream.read(2_000_001)
+            with remote.open(snapshot_path, "rb") as snapshot_stream:
+                snapshot_data = snapshot_stream.read(2_000_001)
+        except FileNotFoundError:
+            mismatches.append({"path": relative, "reason": "missing"})
+            continue
+        if source_data != snapshot_data:
+            mismatches.append({"path": relative, "reason": "content"})
+    return {"files_checked": len(receipt["files"]), "mismatches": mismatches,
+            "matches": not mismatches, "source_root": str(project),
+            "snapshot_root": str(snapshot)}
+
+
+def compare_snapshot_to_remote(snapshot_root, remote, remote_root):
+    """Compare the published snapshot to the control project by file contents."""
+    snapshot_root = Path(snapshot_root).resolve(strict=True)
+    manifest = framework_source_manifest(snapshot_root)
+    mismatches = []
+    for entry in manifest:
+        relative = PurePosixPath(entry["path"])
+        target = str(PurePosixPath(remote_root) / relative)
+        try:
+            attrs = remote.lstat(target)
+        except FileNotFoundError:
+            mismatches.append({"path": entry["path"], "reason": "missing"})
+            continue
+        import stat
+        if not stat.S_ISREG(attrs.st_mode):
+            mismatches.append({"path": entry["path"], "reason": "not_regular"})
+            continue
+        local_data = (snapshot_root / Path(*relative.parts)).read_bytes()
+        if attrs.st_size != len(local_data):
+            mismatches.append({"path": entry["path"], "reason": "size"})
+            continue
+        with remote.open(target, "rb") as stream:
+            if stream.read(len(local_data) + 1) != local_data:
+                mismatches.append({"path": entry["path"], "reason": "content"})
+    return {"files_checked": len(manifest), "mismatches": mismatches,
+            "matches": not mismatches, "source_root": str(snapshot_root),
+            "remote_root": str(remote_root)}
+
+
+def stage_declared_repair_dependencies(source, target, source_root, job, script, mkdirs):
+    """Stage explicit non-code dependencies and verify the received files.
+
+    Optional repair/staging-manifest.json and <script>.dependencies.json use
+    {"files": ["repair/source/contract.json", ...]}. All paths stay task-local;
+    absent declarations preserve the existing script-only staging contract.
+    """
+    import stat
+    manifests=['repair/staging-manifest.json',str(PurePosixPath(script).with_suffix('.dependencies.json'))]
+    declared=set()
+    for rel in manifests:
+        try:attrs=source.lstat(source_root+'/'+rel)
+        except FileNotFoundError:continue
+        if not stat.S_ISREG(attrs.st_mode) or attrs.st_size>131072:
+            raise ValueError('invalid repair dependency manifest: '+rel)
+        with source.open(source_root+'/'+rel,'rb') as stream:value=json.loads(stream.read())
+        files=value.get('files') if isinstance(value,dict) else None
+        if not isinstance(files,list) or any(not isinstance(p,str) for p in files):
+            raise ValueError('repair dependency manifest requires a files list')
+        declared.update([rel,*files])
+    receipt=[]
+    for rel in sorted(declared):
+        path=PurePosixPath(rel)
+        if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0]!='repair' or not framework_source_file_allowed(rel,0):
+            raise ValueError('repair dependency escapes scope or has unsupported type: '+rel)
+        # Reject linked parents as well as linked leaf files.
+        for index in range(1,len(path.parts)+1):
+            attrs=source.lstat(source_root+'/'+PurePosixPath(*path.parts[:index]).as_posix())
+            if stat.S_ISLNK(attrs.st_mode):raise ValueError('repair dependency is a symlink: '+rel)
+        if not stat.S_ISREG(attrs.st_mode) or attrs.st_size>2_000_000:
+            raise ValueError('repair dependency is missing, nonregular or too large: '+rel)
+        with source.open(source_root+'/'+rel,'rb') as stream:data=stream.read(2_000_001)
+        if path.suffix in {'.py','.sh'}:data=data.replace(b'\r\n',b'\n')
+        destination=job+'/'+rel
+        mkdirs(str(PurePosixPath(destination).parent))
+        try:
+            target.lstat(destination)
+        except FileNotFoundError:
+            with target.open(destination,'wx') as stream:stream.write(data)
+        attrs=target.lstat(destination)
+        if not stat.S_ISREG(attrs.st_mode) or attrs.st_size!=len(data):
+            raise RuntimeError('repair dependency transfer is incomplete: '+rel)
+        with target.open(destination,'rb') as stream:received=stream.read(len(data)+1)
+        if received!=data:raise RuntimeError('repair dependency differs after transfer: '+rel)
+        receipt.append({'path':rel,'bytes':len(data),'verified':True})
+    return receipt
+
+
+def framework_source_file_allowed(name, size):
+    """Include model manifests/templates while excluding machine-local config."""
+    return (PurePosixPath(name).suffix in FRAMEWORK_SOURCE_SUFFIXES
+            and '.local.' not in name and size <= 2_000_000)
+
+
+def atomic_sftp_write(sftp, destination, data, unique_suffix):
+    """Write a complete regular-file replacement, then atomically rename it."""
+    import stat
+    destination = str(PurePosixPath(destination))
+    try:
+        attrs = sftp.lstat(destination)
+    except FileNotFoundError:
+        attrs = None
+    if attrs is not None:
+        if stat.S_ISLNK(attrs.st_mode):
+            raise ValueError("target source is a symlink")
+        if not stat.S_ISREG(attrs.st_mode):
+            raise ValueError("target source is not a regular file")
+    suffix = re.sub(r"[^A-Za-z0-9_.-]", "_", str(unique_suffix))[:32]
+    temporary = str(PurePosixPath(destination).parent / (".fleet-tmp-" + suffix + "-" + uuid.uuid4().hex[:8]))
+    try:
+        with sftp.open(temporary, "wx") as output:
+            output.write(data)
+        sftp.chmod(temporary, stat.S_IMODE(attrs.st_mode) if attrs is not None else 0o644)
+        sftp.posix_rename(temporary, destination)
+    except BaseException:
+        try:
+            sftp.remove(temporary)
+        except (FileNotFoundError, OSError):
+            pass
+        raise
 
 
 def copy_project_directory_allowed(name, python_package=False):
@@ -44,6 +310,102 @@ def remote_directory_contains_python(sftp, path):
         )
     except (FileNotFoundError, OSError):
         return False
+
+
+def business_checkpoint_summary(task_path, expected_cases=()):
+    """Report per-case business state independently from broker/controller liveness."""
+    task = Path(task_path)
+    source = next((p for p in (task / "BUSINESS_CHECKPOINT.json", task / "CHECKPOINT.json",
+                               task / "repair/BUSINESS_CHECKPOINT.json") if p.is_file()), None)
+    raw = json.loads(source.read_text(encoding="utf-8")) if source else None
+    raw_cases, checkpoint_field = checkpoint_cases(raw) if source else ({}, None)
+    aliases = {"92b-mixed": "mixed", "same-host-pd-split": "same_host_pd_split",
+               "multi-host-tp": "multi_host_tp", "cross-host-pd-split": "cross_host_pd_split"}
+    raw_cases = {aliases.get(str(name), str(name)): value for name, value in raw_cases.items()}
+    names = sorted(set(expected_cases) | set(raw_cases))
+    completed = {"completed", "passed", "accepted", "done"}
+    running = {"running", "starting", "active"}
+    pending = {"pending", "queued", "waiting", "deferred", "submitted"}
+    failed = {"failed", "error", "aborted", "cancelled"}
+    blocked = {"blocked", "resource_blocked", "waiting_resource"}
+    cases = {}
+    for name in names:
+        entry = raw_cases.get(name) or {}
+        if not isinstance(entry, dict):
+            entry = {"status": entry}
+        status = str(entry.get("status", entry.get("phase", "pending"))).lower()
+        submitted = bool(entry.get("request_id") or entry.get("fleet_request_id")
+                         or entry.get("job_id") or entry.get("job") or status in running)
+        if status in completed:
+            state = "completed"
+        elif status in running:
+            state = "running"
+        elif status in failed:
+            state = "failed"
+        elif status in blocked:
+            state = "blocked"
+        elif status in pending:
+            state = "pending"
+        else:
+            state = "unknown"
+        cases[name] = {"state": state, "raw_status": status, "submitted": submitted,
+                       "request_id": entry.get("request_id") or entry.get("fleet_request_id"),
+                       "job_id": entry.get("job_id") or entry.get("job"),
+                       "experiment": entry.get("experiment") or entry.get("experiment_id"),
+                       "next_action": entry.get("next_action"),
+                       "last_error": entry.get("last_error"),
+                       "resubmit_allowed": state == "pending" and not submitted}
+    requests = []
+    request_dir = task / "fleet/requests"
+    if request_dir.is_dir():
+        for path in request_dir.glob("*.json"):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if value.get("action") == "run":
+                requests.append(value.get("request_id") or path.stem)
+    return {"checkpoint": str(source) if source else None, "cases": cases,
+            "submitted_request_ids": sorted(str(v) for v in requests),
+            "checkpoint_field": checkpoint_field, "controller_independent": True}
+
+
+def checkpoint_cases(raw):
+    """Read stable ``cases`` and the narrow legacy ``four_types`` alias."""
+    if not isinstance(raw, dict):
+        raise ValueError("business checkpoint must be a JSON object")
+
+    def normalize(value, field):
+        if isinstance(value, list):
+            normalized = {}
+            for item in value:
+                if not isinstance(item, dict):
+                    raise ValueError(f"business checkpoint {field} list item must be an object")
+                name = item.get("case") or item.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(f"business checkpoint {field} list item needs case or name")
+                if name in normalized:
+                    raise ValueError(f"business checkpoint {field} has duplicate case name: {name}")
+                normalized[name] = item
+            value = normalized
+        if not isinstance(value, dict):
+            raise ValueError(f"business checkpoint {field} must be an object or list")
+        if any(not isinstance(name, str) or not name.strip() or not isinstance(item, dict)
+               for name, item in value.items()):
+            raise ValueError(f"business checkpoint {field} entries must be named objects")
+        return value
+
+    cases = normalize(raw["cases"], "cases") if "cases" in raw else None
+    legacy = normalize(raw["four_types"], "four_types") if "four_types" in raw else None
+    if cases:
+        return cases, "cases"
+    if legacy:
+        return legacy, "four_types"
+    if cases is not None:
+        return cases, "cases"
+    if legacy is not None:
+        return legacy, "four_types"
+    raise ValueError("business checkpoint must contain cases (or legacy four_types)")
 
 
 def container_to_host_read_path(path, mounts):
@@ -87,7 +449,7 @@ def process_table_empty(text):
 
 
 def validate_request(value, targets):
-    if set(value) - {"request_id", "action", "host", "job", "script", "devices", "args", "asset"}:
+    if set(value) - {"request_id", "action", "host", "job", "script", "devices", "args", "asset", "framework_source"}:
         raise ValueError("unexpected fleet request fields")
     identifier(value.get("request_id"))
     identifier(value.get("job", value["request_id"]))
@@ -104,10 +466,69 @@ def validate_request(value, targets):
     if not isinstance(args, list) or any(not isinstance(x, str) or len(x) > 4096 for x in args):
         raise ValueError("arguments must be bounded strings")
     if value["action"] == "run":
+        contract = value.get("framework_source")
+        if (not isinstance(contract, dict)
+                or contract.get("schema") != FRAMEWORK_SOURCE_RECEIPT_SCHEMA
+                or contract.get("branch") != "main"
+                or contract.get("receipt_path") != FRAMEWORK_SOURCE_RECEIPT):
+            raise ValueError("run requires the published framework snapshot receipt contract")
         script = PurePosixPath(value.get("script", ""))
         if script.is_absolute() or ".." in script.parts or script.suffix not in {".py", ".sh"} or script.parts[0] != "repair":
             raise ValueError("script must be a task repair Python or Bash file")
     return value
+
+
+def _absolute_posix_path(value, label):
+    path = PurePosixPath(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{label} must be an absolute traversal-free path")
+    return path
+
+
+def validate_remote_path(expected, resolved, label="remote task path"):
+    """Reject a path whose realpath escaped the registered project."""
+    expected_path = _absolute_posix_path(expected, label)
+    resolved_path = _absolute_posix_path(resolved, f"resolved {label}")
+    if resolved_path != expected_path:
+        raise ValueError(f"{label} resolves outside the registered project")
+    return str(expected_path)
+
+
+def public_fleet_metadata(control_host, control_project, task, targets):
+    """Build the non-sensitive target manifest exposed to the remote task."""
+    if not isinstance(control_host, str) or not control_host.strip():
+        raise ValueError("control host is required")
+    control_project = _absolute_posix_path(control_project, "control project")
+    task = identifier(task)
+    if not isinstance(targets, dict) or not targets:
+        raise ValueError("fleet target map is required")
+    safe_targets = {}
+    for host, value in sorted(targets.items()):
+        if not isinstance(host, str) or not host.strip() or not isinstance(value, dict):
+            raise ValueError("fleet target metadata is malformed")
+        management = _absolute_posix_path(value.get("management"), f"management for {host}")
+        project = _absolute_posix_path(value.get("project"), f"project for {host}")
+        container = value.get("container")
+        if not isinstance(container, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", container):
+            raise ValueError(f"container for {host} is invalid")
+        protected = value.get("protected_devices", [])
+        if (not isinstance(protected, list) or len(set(protected)) != len(protected)
+                or any(type(device) is not int or not 0 <= device < 32 for device in protected)):
+            raise ValueError(f"protected devices for {host} are invalid")
+        safe_targets[host] = {
+            "host": host,
+            "container": container,
+            "project": str(project),
+            "management": str(management),
+            "protected_devices": sorted(protected),
+        }
+    return {
+        "schema": "fullnet.fleet-config.v1",
+        "control_host": control_host,
+        "control_project": str(control_project),
+        "task": task,
+        "targets": safe_targets,
+    }
 
 
 # Runs inside the selected personal container, under the target job directory.
@@ -120,6 +541,68 @@ def health_status_ok(text):
  return bool(values) and all(value.upper()=='OK' for value in values)
 def process_table_empty(text):
  return bool(re.search(r"No process in device|No running processes found in NPU",text,re.IGNORECASE))
+def acquire_device_leases(root, devices):
+ if not devices:return []
+ root=pathlib.Path(root).resolve(strict=True)
+ if not root.is_dir():raise RuntimeError('project root is not a directory')
+ runtime_dir=root/'.runtime';lease_dir=runtime_dir/'device-leases'
+ for directory in (runtime_dir,lease_dir):
+  if directory.is_symlink():raise RuntimeError('device lease directory is a symlink')
+  if directory.exists() and not directory.is_dir():raise RuntimeError('device lease path is not a directory')
+  if not directory.resolve(strict=False).is_relative_to(root):raise RuntimeError('device lease directory escapes project')
+  directory.mkdir(parents=True,exist_ok=True)
+  if directory.is_symlink() or not directory.resolve(strict=True).is_relative_to(root):raise RuntimeError('device lease directory escapes project')
+ leases=[]
+ try:
+  import fcntl
+  for device in sorted(set(devices)):
+   path=lease_dir/('npu-'+str(device)+'.lock')
+   if path.is_symlink() or not path.resolve(strict=False).is_relative_to(root):raise RuntimeError('device lease file escapes project')
+   flags=os.O_CREAT|os.O_RDWR
+   if hasattr(os,'O_NOFOLLOW'):flags|=os.O_NOFOLLOW
+   if hasattr(os,'O_CLOEXEC'):flags|=os.O_CLOEXEC
+   try:fd=os.open(str(path),flags,0o600)
+   except OSError as exc:raise RuntimeError('device lease file is unavailable: '+str(device)) from exc
+   stream=os.fdopen(fd,'a+b',closefd=True)
+   try:fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+   except (BlockingIOError,OSError) as exc:
+    stream.close();raise RuntimeError('device lease busy: '+str(device)) from exc
+   leases.append(stream)
+  return leases
+ except BaseException:
+  release_device_leases(leases);raise
+def release_device_leases(leases):
+ try:import fcntl
+ except ImportError:fcntl=None
+ for stream in reversed(leases):
+  try:
+   if fcntl is not None:fcntl.flock(stream.fileno(),fcntl.LOCK_UN)
+  except OSError:pass
+  try:stream.close()
+  except OSError:pass
+def write_device_post(job,devices,tool,env,workload_started):
+ for d in devices:
+  target=job/f'device-{d}-post.txt'
+  if not workload_started:
+   target.write_text('not_run: workload did not start; post device query skipped\n');continue
+  try:
+   p=subprocess.run([str(tool or pathlib.Path(c['management'])/'tools/bin/npu-smi'),'info','-t','proc-mem','-i',str(d)],capture_output=True,text=True,timeout=30,env=env)
+   target.write_text(p.stdout+p.stderr)
+  except Exception as e:target.write_text(str(e))
+def validate_structured_outputs(directory):
+ checked=[]
+ for name in ('result.json','validation.json'):
+  p=directory/name
+  if not p.exists():continue
+  if p.is_symlink() or not p.resolve(strict=True).is_relative_to(directory.resolve(strict=True)):
+   raise RuntimeError(name+' resolves outside the job')
+  if p.stat().st_size>16*1024*1024:
+   raise RuntimeError(name+' exceeds compact result limit; keep bulk data separately')
+  try:json.loads(p.read_text(encoding='utf-8'))
+  except (ValueError,UnicodeError) as exc:
+   raise RuntimeError(name+' must contain one complete JSON document: '+str(exc)) from exc
+  checked.append(name)
+ return checked
 j=pathlib.Path(sys.argv[1]).resolve(strict=True); c=json.loads((j/'config.json').read_text())
 root=pathlib.Path(c['project']).resolve(strict=True)
 if not j.is_relative_to(root):raise ValueError('job outside project')
@@ -141,9 +624,10 @@ for cand in (j/'tools/npu-smi',pathlib.Path(c['management'])/'tools/bin/npu-smi'
  except OSError:pass
 def write(name,value):
  p=j/name;t=p.with_suffix('.tmp');t.write_text(json.dumps(value,ensure_ascii=False,indent=2));t.replace(p)
-child=None;code=1
+child=None;code=1;leases=[];workload_started=False
 try:
  if c['devices']:
+  leases=acquire_device_leases(root,c['devices'])
   if tool is None:raise RuntimeError('no host-matched npu-smi tool staged or shared for this container')
   mapping=subprocess.run([str(tool),'info','-m'],capture_output=True,text=True,timeout=30,env=dlenv)
   (j/'device-mapping.txt').write_text(mapping.stdout+mapping.stderr)
@@ -160,6 +644,7 @@ try:
  argv=['bash',str(j/c['script'])] if c['script'].endswith('.sh') else ['python3','-B',str(j/c['script'])]
  with (j/'workload.log').open('x') as log:
   child=subprocess.Popen(argv+c['args'],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+  workload_started=True
   write('process.json',{'pid':child.pid,'pgid':child.pid,'argv':argv+c['args'],'job':c['job'],'project':str(root)})
   while child.poll() is None:
    if (j/'CANCEL').exists():
@@ -169,7 +654,11 @@ try:
     break
    time.sleep(2)
   code=child.wait()
+  if code==0:
+   checked=validate_structured_outputs(j)
+   write('output-check.json',{'status':'passed','checked_files':checked,'business_acceptance':'NOT_VALIDATED'})
 except BaseException as e:
+ if code==0:code=1
  write('failure.json',{'error':type(e).__name__,'detail':str(e)[:2000]})
  if child and child.poll() is None:
   os.killpg(child.pid,signal.SIGTERM)
@@ -179,12 +668,58 @@ finally:
  (j/'exit.txt').write_text(str(code)+'\n')
  write('state.json',{'status':'exited','exit':code,'finished_at':time.time(),'runner_pid':os.getpid()})
  # Device post-state is retained independently from the script exit status.
- for d in c['devices']:
-  try:
-   p=subprocess.run([str(tool or pathlib.Path(c['management'])/'tools/bin/npu-smi'),'info','-t','proc-mem','-i',str(d)],capture_output=True,text=True,timeout=30,env=dlenv)
-   (j/f'device-{d}-post.txt').write_text(p.stdout+p.stderr)
-  except Exception as e:(j/f'device-{d}-post.txt').write_text(str(e))
+ try:write_device_post(j,c['devices'],tool,dlenv,workload_started)
+ finally:release_device_leases(leases)
 sys.exit(code)
+'''
+
+
+STATUS_READER = r'''
+import json,pathlib,sys
+JSON_LIMIT=256*1024
+LOG_LIMIT=14000
+JSON_FILES={'state.json','process.json','failure.json','result.json','validation.json'}
+j=pathlib.Path(sys.argv[1]).resolve(strict=True);r=pathlib.Path(sys.argv[2]).resolve(strict=True)
+if not j.is_relative_to(r/'runs'/sys.argv[3]/'fleet-jobs'):raise ValueError('job outside task')
+if sys.argv[4]=='cancel':(j/'CANCEL').touch(exist_ok=True)
+o={'job':str(j),'file_metadata':{}}
+def safe_file(name):
+ p=j/name
+ if p.is_symlink():
+  raise ValueError('status file symlink or path escape: '+str(p))
+ if not p.is_file():return None
+ if not p.resolve(strict=True).is_relative_to(j):
+  raise ValueError('status file symlink or path escape: '+str(p))
+ return p
+def json_value(p):
+ size=p.stat().st_size
+ with p.open('rb') as stream:
+  raw=stream.read(JSON_LIMIT+1)
+ if size<=JSON_LIMIT and len(raw)<=JSON_LIMIT:
+  value=raw.decode('utf-8',errors='replace')
+  metadata={'path':str(p),'original_bytes':size,'truncated':False,
+            'snippet_start_byte':0,'limit_bytes':JSON_LIMIT}
+  try:json.loads(value);metadata['json_valid']=True
+  except ValueError as exc:metadata.update(json_valid=False,json_error=str(exc))
+  return value,metadata
+ return {'status':'truncated','truncated':True,'path':str(p),'original_bytes':size,
+         'limit_bytes':JSON_LIMIT,'snippet_start_byte':0},{'path':str(p),
+         'original_bytes':size,'truncated':True,'snippet_start_byte':0,'limit_bytes':JSON_LIMIT}
+def log_value(p):
+ size=p.stat().st_size
+ start=max(0,size-LOG_LIMIT)
+ with p.open('rb') as stream:
+  stream.seek(start)
+  raw=stream.read(LOG_LIMIT)
+ return raw.decode('utf-8',errors='replace'),{'path':str(p),'original_bytes':size,
+         'truncated':start>0,'snippet_start_byte':start,'limit_bytes':LOG_LIMIT}
+for n in ['state.json','process.json','failure.json','exit.txt','workload.log','runner.log','result.json','validation.json','report.md']:
+ p=safe_file(n)
+ if p is not None:
+  value,metadata=json_value(p) if n in JSON_FILES else log_value(p)
+  o[n]=value
+  o['file_metadata'][n]=metadata
+print(json.dumps(o,ensure_ascii=False))
 '''
 
 
@@ -193,7 +728,53 @@ class Broker:
         self.helper, self.control, self.project = helper, control, project
         self.task, self.targets, self.local = identifier(task), targets, Path(local)
         self.run = PurePosixPath(project) / "runs" / task
+        self.bridge_path, self.loaded_bridge = _LOADED_BRIDGE_PATH, _LOADED_BRIDGE_CONTENT
         self.local.mkdir(parents=True, exist_ok=True)
+
+    def freshness(self):
+        return {
+            "framework_source_receipt_schema": FRAMEWORK_SOURCE_RECEIPT_SCHEMA,
+            "broker_source_file": "scripts/ops/registered_fleet_bridge.py",
+            "loaded_source_matches_disk": loaded_bridge_matches_disk(
+                self.bridge_path, self.loaded_bridge),
+        }
+
+    def _read_source_receipt(self, source):
+        path = str(PurePosixPath(self.project) / FRAMEWORK_SOURCE_RECEIPT)
+        with source.open(path, "rb") as stream:
+            raw = stream.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise ValueError("published framework snapshot receipt is too large")
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise ValueError("published framework snapshot receipt is invalid JSON") from exc
+
+    def _check_published_source(self, source, receipt):
+        if not loaded_bridge_matches_disk(self.bridge_path, self.loaded_bridge):
+            raise RuntimeError("broker source changed on disk; restart broker before a new run")
+        files = receipt.get("files") if isinstance(receipt, dict) else None
+        validated = validate_framework_receipt(receipt, files or [])
+        comparison = compare_control_to_snapshot(source, self.project, validated)
+        if not comparison["matches"]:
+            raise RuntimeError(
+                "control project does not match the published tracked snapshot: "
+                + json.dumps(comparison["mismatches"][:8], ensure_ascii=False))
+        return validated, comparison
+
+    def _target_has_active_workload(self, client, root, container):
+        import inspect
+        code = ('import json,sys,os\nfrom pathlib import Path,PurePosixPath\n'
+                + inspect.getsource(project_workload_processes)
+                + '\nprint(json.dumps(project_workload_processes(sys.argv[1])))')
+        result = json.loads(self.call(
+            client, shlex.join(["docker", "exec", "-i", container, "python3", "-B", "-c", code, root]),
+            timeout=45))
+        if result.get("busy"):
+            raise RuntimeError(
+                "target project has an active run; refusing framework hot update: "
+                + json.dumps(result.get("active", [])[:8]))
+        return result
 
     def call(self, client, cmd, body=None, timeout=45):
         rc, out, err = self.helper.call(client, cmd, body, timeout=timeout)
@@ -207,13 +788,54 @@ class Broker:
             out.write(json.dumps(value, ensure_ascii=False).encode())
         sftp.posix_rename(temp, name)
 
+    def publish_target_metadata(self):
+        """Publish a task-local, credential-free manifest on a fresh connection."""
+        if not getattr(self, "control_host", None):
+            raise ValueError("control host must be set before publishing fleet metadata")
+        metadata = public_fleet_metadata(self.control_host, self.project, self.task, self.targets)
+        run = str(self.run)
+        validate_remote_path(
+            str(_absolute_posix_path(self.project, "control project")),
+            self.call(self.control, shlex.join(["realpath", "-e", self.project])).strip(),
+            "control project",
+        )
+        validate_remote_path(run, self.call(self.control, shlex.join(["realpath", "-e", run])).strip())
+        sf = self.control.open_sftp()
+        target = str(self.run / "fleet-config.local.json")
+        temporary = target + ".tmp"
+        try:
+            import stat
+            for path in (target, temporary):
+                try:
+                    attrs = sf.lstat(path)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(attrs.st_mode):
+                    raise ValueError("fleet metadata path must not be a symlink")
+            self.atomic(sf, target, metadata)
+        finally:
+            sf.close()
+        return {"path": target, "schema": metadata["schema"], "targets": sorted(metadata["targets"])}
+
+    def asset_source_container(self):
+        """The CPU control host need not be a device target."""
+        container = getattr(self, 'control_container', 'w00939120')
+        if not isinstance(container, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container):
+            raise ValueError('invalid registered control container')
+        return container
+
     def execute(self, request, source):
         value = validate_request(request, self.targets)
         target = self.targets[value["host"]]
         root, management, con = target["project"], target["management"], target["container"]
         if set(value.get("devices", [])) & set(target.get("protected_devices", [])):
             raise ValueError("selected device is protected by an existing service")
-        client = self.helper.connect(value["host"])
+        source_receipt = None
+        source_comparison = None
+        if value["action"] == "run":
+            source_receipt = self._read_source_receipt(source)
+            source_receipt, source_comparison = self._check_published_source(source, source_receipt)
+        client = self.helper.connect(target.get("ssh_alias", value["host"]))
         try:
             job = str(PurePosixPath(root) / "runs" / self.task / "fleet-jobs" / value.get("job", value["request_id"]))
             if value["action"] == "copy_asset":
@@ -221,13 +843,14 @@ class Broker:
                     raise ValueError("asset already belongs to the control project")
                 asset = value["asset"]
                 origin = self.project + "/assets/weights/" + asset
+                source_container = self.asset_source_container()
                 code = "import pathlib,json,sys; p=pathlib.Path(sys.argv[1]).resolve(strict=True); print(json.dumps({'root':str(p),'files':[{'path':str(f.relative_to(p)),'size':f.stat().st_size} for f in p.rglob('*') if f.is_file() and f.suffix in {'.safetensors','.json','.txt','.model','.tiktoken','.py','.jinja'} and f.resolve().is_relative_to(p)]}))"
-                listing = json.loads(self.call(self.control, shlex.join(["docker", "exec", "-i", "--user", "0", self.targets[self.control_host]["container"], "python3", "-B", "-c", code, origin]), timeout=60))
+                listing = json.loads(self.call(self.control, shlex.join(["docker", "exec", "-i", "--user", "0", source_container, "python3", "-B", "-c", code, origin]), timeout=60))
                 if not any(x["path"].endswith(".safetensors") for x in listing["files"]):
                     raise ValueError("source has no real model weight shards")
                 mounts_raw = self.call(self.control, shlex.join([
                     "docker", "inspect", "--format", "{{json .Mounts}}",
-                    self.targets[self.control_host]["container"],
+                    source_container,
                 ]), timeout=30).strip()
                 try:
                     mounts = json.loads(mounts_raw)
@@ -316,22 +939,14 @@ print(json.dumps(o,ensure_ascii=False))
 '''
                 return json.loads(self.call(client, shlex.join(["python3", "-B", "-", management, root, con]), code, 100))
             if value["action"] in {"status", "cancel"}:
-                code = r'''
-import pathlib,json,sys
-j=pathlib.Path(sys.argv[1]).resolve(strict=True);r=pathlib.Path(sys.argv[2]).resolve(strict=True)
-if not j.is_relative_to(r/'runs'/sys.argv[3]/'fleet-jobs'):raise ValueError('job outside task')
-if sys.argv[4]=='cancel':(j/'CANCEL').touch(exist_ok=True)
-o={'job':str(j)}
-for n in ['state.json','process.json','failure.json','exit.txt','workload.log','runner.log','result.json','validation.json','report.md']:
- p=j/n
- if p.is_file():o[n]=p.read_text(errors='replace')[-14000:]
-print(json.dumps(o,ensure_ascii=False))
-'''
+                code = STATUS_READER
                 return json.loads(self.call(client, shlex.join(["docker", "exec", "-i", "--user", "0", con, "python3", "-B", "-", job, root, self.task, value["action"]]), code))
             # Realpaths and container mount visibility are checked before writing.
             check = "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True,exist_ok=True); assert str(p.resolve())==str(p), 'project symlink outside registered root'"
             self.call(client, shlex.join(["python3", "-B", "-c", check, root]))
             self.call(client, shlex.join(["docker", "exec", con, "test", "-d", root]))
+            if value["action"] == "run" and value["host"] != self.control_host:
+                self._target_has_active_workload(client, root, con)
             sf = client.open_sftp()
             try:
                 try:
@@ -365,44 +980,75 @@ print(json.dumps(o,ensure_ascii=False))
                             with sf.open(job + "/" + rel, "wx") as out:
                                 out.write(data.replace(b"\r\n", b"\n"))
                 copy_scripts("repair")
+                dependency_receipt=stage_declared_repair_dependencies(
+                    source,sf,source_root,job,value['script'],
+                    lambda parent:self.helper.mkdirs(sf,parent,0o700))
+                self.atomic(sf,job+'/staging-dependencies.json',{'files':dependency_receipt})
                 # Stage the current framework, retaining overwritten target sources.
                 # This is a project transfer, not an environment/model installation.
+                framework_sync = {
+                    "schema": FRAMEWORK_SOURCE_RECEIPT_SCHEMA,
+                    "source_policy": "published-main-tracked-snapshot",
+                    "source_root": self.project,
+                    "target_root": root,
+                    "job": job,
+                    "receipt_path": str(PurePosixPath(self.project) / FRAMEWORK_SOURCE_RECEIPT),
+                    "source_files_checked": source_comparison["files_checked"] if source_comparison else None,
+                    "source_matches_published_snapshot": source_comparison["matches"] if source_comparison else None,
+                    "excluded_directories": sorted(PROJECT_COPY_SKIP_DIRS),
+                    "files": [],
+                }
                 if value["host"] != self.control_host:
-                    def copy_project(relative):
-                        import stat
-                        try:entries = source.listdir_attr(self.project + "/" + relative)
-                        except FileNotFoundError:return
-                        for ent in entries:
-                            rel = relative + "/" + ent.filename
-                            if not copy_project_directory_allowed(
-                                ent.filename,
-                                python_package=(ent.filename == "cache" and remote_directory_contains_python(
-                                    source, self.project + "/" + rel
-                                )),
-                            ):
+                    import stat
+                    for rel in source_receipt["files"]:
+                        # Source content has just been checked against the published
+                        # snapshot. Never stage untracked scripts or local config.
+                        remote_regular_source(source, self.project, rel)
+                        with source.open(self.project + "/" + rel, "rb") as inp:
+                            data = inp.read(2_000_001)
+                        dest = root + "/" + rel
+                        parent = str(PurePosixPath(dest).parent)
+                        # Inspect lexical parents before mkdir can follow a link.
+                        current = PurePosixPath(root)
+                        for part in PurePosixPath(rel).parts[:-1]:
+                            current = current / part
+                            try:
+                                attrs = sf.lstat(str(current))
+                            except FileNotFoundError:
                                 continue
-                            if stat.S_ISDIR(ent.st_mode):
-                                copy_project(rel)
-                            elif stat.S_ISREG(ent.st_mode) and PurePosixPath(rel).suffix in {".py", ".sh", ".md", ".toml", ".json", ".txt"} and ".local." not in ent.filename:
-                                if ent.st_size > 2_000_000:continue
-                                with source.open(self.project + "/" + rel, "rb") as inp:data = inp.read()
-                                dest = root + "/" + rel
-                                self.helper.mkdirs(sf, str(PurePosixPath(dest).parent), 0o700)
-                                actual_parent = self.call(client, shlex.join(["realpath", "-e", str(PurePosixPath(dest).parent)])).strip()
-                                if not PurePosixPath(actual_parent).is_relative_to(PurePosixPath(root)):
-                                    raise ValueError("target source directory resolves outside project")
-                                try:
-                                    attrs = sf.lstat(dest)
-                                    if not stat.S_ISREG(attrs.st_mode):raise ValueError("target source is not a regular file")
-                                    with sf.open(dest, "rb") as old:old_data = old.read()
-                                    if old_data == data:continue
-                                    backup = job + "/source-before/" + rel
-                                    self.helper.mkdirs(sf, str(PurePosixPath(backup).parent), 0o700)
-                                    with sf.open(backup, "wx") as out:out.write(old_data)
-                                except FileNotFoundError:pass
-                                with sf.open(dest, "w") as out:out.write(data)
-                    for directory in ("scripts", "src", "models", ".agents", "requirements"):
-                        copy_project(directory)
+                            if not stat.S_ISDIR(attrs.st_mode):
+                                raise ValueError("target source parent is not a regular directory")
+                        self.helper.mkdirs(sf, parent, 0o755)
+                        changed = True
+                        backup = None
+                        try:
+                            attrs = sf.lstat(dest)
+                            if not stat.S_ISREG(attrs.st_mode):
+                                raise ValueError("target source is not a regular file")
+                            with sf.open(dest, "rb") as old:
+                                old_data = old.read()
+                            if old_data == data:
+                                changed = False
+                            else:
+                                backup = job + "/source-before/" + rel
+                                self.helper.mkdirs(sf, str(PurePosixPath(backup).parent), 0o700)
+                                with sf.open(backup, "wx") as out:
+                                    out.write(old_data)
+                        except FileNotFoundError:
+                            pass
+                        framework_sync["files"].append({
+                            "path": rel, "source_path": self.project + "/" + rel,
+                            "target_path": dest, "bytes": len(data),
+                            "changed": changed, "backup_path": backup})
+                        if changed:
+                            atomic_sftp_write(sf, dest, data, value["request_id"])
+                        with sf.open(dest, "rb") as actual:
+                            if actual.read(len(data) + 1) != data:
+                                raise RuntimeError("target source failed content verification: " + rel)
+                    framework_sync["status"] = "verified"
+                else:
+                    framework_sync["status"] = "control_project_already_current"
+                self.atomic(sf, job + "/framework-sync.json", framework_sync)
                 # Confirm the selected source is a regular file after canonicalization.
                 actual = self.call(self.control, shlex.join(["realpath", "-e", str(self.run / value["script"])] )).strip()
                 if not PurePosixPath(actual).is_relative_to(self.run / "repair"):
@@ -438,6 +1084,7 @@ print(json.dumps(o,ensure_ascii=False))
             return {"submitted": True, "host": value["host"], "project": root, "container": con,
                     "job": config["job"], "directory": job, "socket": sock, "session": session,
                     "staged_npu_smi": staged_tool or None,
+                    "staged_dependencies": dependency_receipt,
                     "acceptance": "submitted_not_validated"}
         finally:
             client.close()
@@ -488,28 +1135,105 @@ def terminal_controller_state(value):
             and value.get('credentials_persisted') is False)
 
 
-def controller_process_alive(task_dir, pid=None, proc_root=Path('/proc'), uid=None):
-    """Match this task's controller, including launchers without ACTIVE.json."""
+def _normalized_controller_path(value):
+    return PurePosixPath(posixpath.normpath(os.fsdecode(value).replace('\\', '/')))
+
+
+def _controller_command_matches(args, task_dir, controller_path=None):
+    """Match legacy glm_task or the current task-local controller.py layout."""
+    task = _normalized_controller_path(task_dir)
+    raw_task = str(task).encode()
+    target = _normalized_controller_path(controller_path) if controller_path is not None else None
+    task_controller_root = task / 'controllers'
+    legacy_task_arg = raw_task in args
+    for arg in args:
+        try:
+            path = _normalized_controller_path(arg)
+        except (TypeError, ValueError):
+            continue
+        if path.name == 'glm_task.py':
+            if legacy_task_arg:
+                return True
+        if path.name == 'controller.py':
+            try:
+                is_task_controller = path.is_relative_to(task_controller_root) or path == task / 'controller.py'
+                if is_task_controller and (target is None or path == target):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def controller_process_alive(task_dir, pid=None, proc_root=Path('/proc'), uid=None, controller_path=None):
+    """Match this task's controller by UID and exact legacy/current path layout."""
     task_dir = str(task_dir)
     if uid is None:
         uid = os.getuid() if hasattr(os, 'getuid') else None
-    candidates = [proc_root / str(pid)] if type(pid) is int else []
-    try:
-        candidates.extend(p for p in proc_root.iterdir() if p.name.isdecimal())
-    except OSError:
-        pass
+    candidate = proc_root / str(pid) if type(pid) is int else None
+    if candidate is not None and candidate.exists():
+        # An existing PID with a different identity must be rejected. Only a
+        # missing/stale PID permits discovery of this exact task's controller.
+        candidates = [candidate]
+    else:
+        try:
+            candidates = [p for p in proc_root.iterdir() if p.name.isdecimal()]
+        except OSError:
+            candidates = []
     for process in candidates:
         try:
             if uid is not None and process.stat().st_uid != uid:
                 continue
             args = process.joinpath('cmdline').read_bytes().split(b'\0')
-            if task_dir.encode() in args and any(
-                Path(os.fsdecode(arg)).name == 'glm_task.py' for arg in args if arg
-            ):
+            if _controller_command_matches(args, task_dir, controller_path):
                 return True
         except OSError:
             continue
     return False
+
+
+def latest_controller_status(task_dir, proc_root=Path('/proc')):
+    """Read the newest real controllers/<host>/glmNN state, never task-root STATE."""
+    task = Path(task_dir)
+    candidates = []
+    controllers = task / 'controllers'
+    if controllers.is_dir():
+        for controller_dir in controllers.glob('*/glm*'):
+            state_path = controller_dir / 'STATE.json'
+            identity_path = controller_dir / 'RUN_IDENTITY.json'
+            active_path = controller_dir / 'ACTIVE.json'
+            if not any(path.is_file() for path in (state_path, identity_path, active_path)):
+                continue
+            mtimes = [path.stat().st_mtime for path in (state_path, identity_path, active_path)
+                      if path.is_file()]
+            try:
+                state = json.loads(state_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                state = None
+            try:
+                identity = json.loads(identity_path.read_text(encoding='utf-8')) if identity_path.is_file() else None
+            except (OSError, ValueError):
+                identity = None
+            try:
+                active = json.loads(active_path.read_text(encoding='utf-8')) if active_path.is_file() else {}
+            except (OSError, ValueError):
+                active = {}
+            pid = active.get('controller_pid') or active.get('model_process', {}).get('pid')
+            alive = controller_process_alive(
+                task, pid, proc_root=proc_root,
+                controller_path=controller_dir / 'controller.py')
+            candidates.append((max(mtimes), controller_dir, state, identity, active, alive))
+    if not candidates:
+        return {'status': 'unknown', 'reason': 'no_controller_state_found', 'controller_independent': True}
+    _, directory, state, identity, active, alive = max(candidates, key=lambda item: item[0])
+    if alive:
+        status = 'running'
+    elif terminal_controller_state(state):
+        status = 'exited'
+    else:
+        status = 'unknown'
+    return {'status': status, 'controller_dir': str(directory), 'state': state,
+            'run_identity': identity, 'active': active, 'controller_alive': alive,
+            'controller_independent': True}
 
 
 def reconcile_status(broker):
@@ -517,8 +1241,12 @@ def reconcile_status(broker):
     code = r'''import json,pathlib,sys,time
 r=pathlib.Path(sys.argv[1]);task=sys.argv[2];sys.path.insert(0,str(r))
 from scripts.ops import deployment_matrix as matrix
-from scripts.ops.registered_fleet_bridge import controller_process_alive, terminal_controller_state
+from scripts.ops.registered_fleet_bridge import latest_controller_status, business_checkpoint_summary
 p=r/'runs'/task;out={'at':time.time(),'task':task}
+try:
+ out['business']=business_checkpoint_summary(p,('mixed','same_host_pd_split','multi_host_tp','cross_host_pd_split'))
+except Exception as e:
+ out['business']={'controller_independent':True,'error':type(e).__name__,'detail':str(e)[:1000]}
 if (p/'deployment-matrix.json').is_file():
  # A stale job-state file is not evidence of a live job.
  ledger=p/'ledger.json'
@@ -536,15 +1264,8 @@ if (p/'deployment-matrix.json').is_file():
     value.update(status='interrupted',reconciled_at=time.time(),reason='recorded business process is no longer present')
     tmp=f.with_suffix('.reconcile.tmp');tmp.write_text(json.dumps(value));tmp.replace(f)
  out['matrix']=matrix.refresh_matrix(r,task)
-for name in ('STATE.json','ACTIVE.json'):
- f=p/name
- if f.is_file():
-  try:out[name]=json.loads(f.read_text())
-  except ValueError:out[name]={'status':'incomplete_json'}
-# These counts describe the controller, never model acceptance.
-c=out.get('STATE.json',{});active=out.get('ACTIVE.json',{});pid=active.get('controller_pid')
-alive=controller_process_alive(p,pid)
-out['controller_status']='running' if alive else ('exited' if terminal_controller_state(c) else 'not_running')
+out['controller']=latest_controller_status(p)
+out['controller_status']=out['controller']['status']
 f=p/'BACKGROUND_STATUS.json';t=f.with_suffix('.tmp');t.write_text(json.dumps(out,ensure_ascii=False));t.replace(f)
 print(json.dumps({'task':task,'controller_status':out['controller_status'],'at':out['at']}))
 '''
@@ -567,6 +1288,10 @@ def main():
             raise ValueError("target differs from registered inventory")
         if target["project"] != target["management"] + "/projects/vllm":
             raise ValueError("fleet writes must stay in the registered vllm project")
+        registered_alias = permitted[host]["alias"]
+        if target.get("ssh_alias", registered_alias) != registered_alias:
+            raise ValueError("SSH alias differs from registered inventory")
+        target["ssh_alias"] = registered_alias
     receipt_root = Path(c['local_receipts'])
     receipt_root.mkdir(parents=True, exist_ok=True)
     heartbeat = receipt_root / 'broker-heartbeat.json'
@@ -589,6 +1314,9 @@ def main():
             client.get_transport().set_keepalive(30)
             broker = Broker(helper, client, c["control_project"], c["task"], c["targets"], c["local_receipts"])
             broker.control_host = c["control_host"]
+            broker.control_container = c.get("control_container", "w00939120")
+            broker.asset_source_container()
+            broker.publish_target_metadata()
             while True:
                 broker.poll()
                 if a.once:
@@ -597,7 +1325,7 @@ def main():
                 reconnect = False
                 try:
                     now = time.time()
-                    value = {'status':'connected','at':now,'pid':os.getpid(),'task':c['task']}
+                    value = {'status':'connected','at':now,'pid':os.getpid(),'task':c['task'], **broker.freshness()}
                     broker.atomic(sf, str(broker.run/'fleet/broker-heartbeat.json'), value)
                     heartbeat.write_text(json.dumps(value),encoding='utf-8')
                     try:

@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .config import runtime
+from .config import SUPPORTED_NPU_PLATFORMS, runtime
 from .evaluation import evaluate, headers, smoke_request, validate_samples
 from .store import RunLock, append_json, experiment, inside, read_json, rows, state, utc, write_json
 
@@ -63,6 +63,8 @@ def plan(root, c, run_id):
 def private_environment(run, c, root=None):
     env = os.environ.copy()
     env.update(c.get("env", {}))
+    if env.get("ASCEND_CUSTOM_OPP_PATH") == "":
+        env.pop("ASCEND_CUSTOM_OPP_PATH")
     if profiler_deferred(c):
         for key in (
             "VLLM_TORCH_PROFILER_DIR",
@@ -80,6 +82,8 @@ def private_environment(run, c, root=None):
              "ASCEND_CACHE_PATH": "cache/ascend", "ASCEND_WORK_PATH": "tmp/ascend",
              "ASCEND_PROCESS_LOG_PATH": "logs/ascend", "TORCHINDUCTOR_CACHE_DIR": "cache/inductor",
              "VLLM_CACHE_ROOT": "cache/vllm", "PYTHONPYCACHEPREFIX": "cache/python"}
+    if c["platform"] in SUPPORTED_NPU_PLATFORMS:
+        paths["OMNI_DUMP_DIR"] = "logs/omni-dump"
     for key, relative in paths.items():
         path = inside(run, Path(run) / relative)
         path.mkdir(parents=True, exist_ok=True)
@@ -94,8 +98,10 @@ def private_environment(run, c, root=None):
     ipc = tempfile.mkdtemp(prefix='', dir=ipc_parent)
     for key in ('TMPDIR', 'TMP', 'TEMP', 'VLLM_RPC_BASE_PATH'):
         env[key] = ipc
-    if c["platform"] in ("a3", "a5"):
-        env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(v) for v in c["devices"])
+    if c["platform"] in SUPPORTED_NPU_PLATFORMS:
+        visible_devices = ",".join(str(v) for v in c["devices"])
+        env["ASCEND_RT_VISIBLE_DEVICES"] = visible_devices
+        env["ASCEND_VISIBLE_DEVICES"] = visible_devices
     env["FULLNET_RUN"] = str(run)
     env["PYTHONUNBUFFERED"] = "1"
     return env
@@ -191,7 +197,13 @@ def _yield_service_paths(run, c, env):
                 continue
 
 
-def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=False):
+def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=False,
+                   before_evaluation=None):
+    """Run optional pre-evaluation gate after readiness/smoke, with owned cleanup.
+
+    ``before_evaluation(run, config)`` must raise on failure. It runs before
+    any frozen evaluation request, including when smoke is disabled.
+    """
     run = experiment(root, model, run_id)
     c = read_json(run / "config.json")
     current = read_json(run / "state.json")
@@ -227,11 +239,15 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
                 state(run, "performance", "deferred_by_user", reason="quality-only stage")
             else:
                 # Deferred import: measurements imports private_environment from here.
-                from .measurements import prepare_profiler_tools
+                from .measurements import prepare_profiler_tools, profile_requested
                 # Profiler children are spawned by the running service, so the
                 # msprof toolchain (shadow PATH + sqlite compat lib) must already
                 # be part of the launch environment before the service starts.
-                tools = prepare_profiler_tools(run, c)
+                requested = profile_requested(c)
+                tools = (prepare_profiler_tools(run, c, launch_env=env) if requested
+                         else prepare_profiler_tools(run, c))
+                if requested and not tools.get("parser_ready"):
+                    raise RuntimeError("profiler parser is not ready before model launch")
             env.update(tools.get("env_updates") or {})
             with (run / "logs" / "service.log").open("w", encoding="utf-8") as output:
                 popen_kwargs = {"cwd": root, "env": env, "stdout": output,
@@ -267,6 +283,15 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
                         state(run, "smoke", "failed", error=type(exc).__name__, detail=str(exc))
                         raise
                     state(run, "smoke", "passed", record="smoke.json")
+                if before_evaluation is not None:
+                    state(run, "before_evaluation", "running")
+                    try:
+                        before_evaluation(run, c)
+                    except BaseException as exc:
+                        state(run, "before_evaluation", "failed", error=type(exc).__name__, detail=str(exc))
+                        state(run, "evaluation", "not_run", reason="before_evaluation gate failed")
+                        raise
+                    state(run, "before_evaluation", "passed")
                 state(run, "evaluation", "running")
                 result = evaluate(run, c)
                 state(run, "evaluation", "passed" if result["protocol_pass"] else "failed",

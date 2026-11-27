@@ -70,6 +70,86 @@ def test_measurement_callback_follows_real_evaluation(project):
     assert observed==['passed']
 
 
+@pytest.mark.parametrize("mode", ["probe_failed", "probe_passed", "default", "smoke_failed"])
+def test_before_evaluation_gate_order_failure_and_owned_cleanup(project, monkeypatch, mode):
+    from unittest.mock import Mock
+    from fullnet import execution
+
+    root, c = project
+    c.setdefault("measurements", {})["deferred_stages"] = ["profile", "performance"]
+    c["service"]["smoke"] = {"enabled": True, "max_tokens": 8}
+    run = plan(root, c, "early-gate")
+    events = []
+
+    class Process:
+        pid = 10000001
+        returncode = None
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+
+    class Ready:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            return json.dumps({"data": [{"id": c["service"]["served_model"]}]}).encode()
+
+    def smoke(*args):
+        events.append("smoke")
+        if mode == "smoke_failed":
+            raise RuntimeError("smoke failed")
+
+    def probe(path, config):
+        assert path == run
+        assert read_json(run / "state.json")["phases"]["smoke"]["status"] == "passed"
+        assert "evaluation" not in read_json(run / "state.json")["phases"]
+        events.append("probe")
+        if mode == "probe_failed":
+            raise RuntimeError("pd split probe failed: LLM_LINK_FAILED")
+
+    result = {"protocol_pass": True, "quality_status": "not_specified",
+              "attempted": 48, "succeeded": 48, "failed": 0,
+              "skipped": 0, "timeout": 0, "samples": 48}
+    evaluate = Mock(side_effect=lambda *args: events.append("evaluate") or result)
+
+    def stop(owned, timeout):
+        assert owned is process
+        events.append("cleanup")
+        process.returncode = -15
+
+    monkeypatch.setattr(execution, "check_port", lambda c: None)
+    monkeypatch.setattr(execution.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(execution.urllib.request, "urlopen", lambda *args, **kwargs: Ready())
+    monkeypatch.setattr(execution, "smoke_request", smoke)
+    monkeypatch.setattr(execution, "evaluate", evaluate)
+    monkeypatch.setattr(execution, "stop_owned", stop)
+    callback = None if mode == "default" else probe
+    if mode in {"probe_failed", "smoke_failed"}:
+        with pytest.raises(RuntimeError, match="probe failed" if mode == "probe_failed" else "smoke failed"):
+            run_experiment(root, "test", "early-gate", before_evaluation=callback)
+        evaluate.assert_not_called()
+    else:
+        assert run_experiment(root, "test", "early-gate", before_evaluation=callback) == result
+        evaluate.assert_called_once()
+    phases = read_json(run / "state.json")["phases"]
+    assert phases["cleanup"]["service_exit"] == -15
+    assert not (run / ".lock").exists()
+    if mode == "probe_failed":
+        assert events == ["smoke", "probe", "cleanup"]
+        assert phases["before_evaluation"]["status"] == "failed"
+        assert phases["evaluation"]["status"] == "not_run"
+        assert phases["execution"]["status"] == "failed"
+    elif mode == "smoke_failed":
+        assert events == ["smoke", "cleanup"]
+        assert "before_evaluation" not in phases
+    else:
+        assert events == (["smoke", "evaluate", "cleanup"] if mode == "default"
+                          else ["smoke", "probe", "evaluate", "cleanup"])
+
+
 def test_failed_missing_predictions_count_in_denominator():
     expected = [{"id": "a", "outputs": ["yes"]}, {"id": "b", "outputs": ["yes"]}]
     prediction = [{"id": "a", "sample": expected[0], "response": "yes", "success": True}]

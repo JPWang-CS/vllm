@@ -52,7 +52,7 @@ def test_active_exclusive_owner_blocks_only_exclusive_host_run(tmp_path):
     assert not (task / "fleet/requests/guard-request.json").exists()
 
 
-def test_active_exclusive_owner_allows_status_and_other_host(tmp_path):
+def test_active_exclusive_owner_allows_status_and_other_host(tmp_path, published_source_fixture):
     module = _module()
     task = _task(tmp_path, {
         "owner": "native-owner",
@@ -68,13 +68,15 @@ def test_active_exclusive_owner_allows_status_and_other_host(tmp_path):
         "exclusive_host": EXCLUSIVE_HOST,
         "job": "native-a3-quality-09",
     })
+    published_source_fixture(tmp_path / "other", task2)
     other = _submit(module, tmp_path / "other", task2, host=OTHER_HOST)
     assert other["host"] == OTHER_HOST
 
 
-def test_unconfigured_or_different_owner_preserves_existing_run_behavior(tmp_path):
+def test_unconfigured_or_different_owner_preserves_existing_run_behavior(tmp_path, published_source_fixture):
     module = _module()
     task = _task(tmp_path, {"owner": "native-owner", "exclusive_active": False,
                             "exclusive_host": EXCLUSIVE_HOST})
+    published_source_fixture(tmp_path, task)
     result = _submit(module, tmp_path, task)
     assert result["status"] == "submitted_to_broker_queue"

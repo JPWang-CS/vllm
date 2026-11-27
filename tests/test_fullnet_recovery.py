@@ -1,4 +1,5 @@
 import importlib.util
+import gzip
 import json
 import os
 import sys
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 from fullnet.evaluation import evaluate, smoke_request
 from fullnet.measurements import (_capture_parse_evidence, _csv_device_kernel_rows,
                                   _offline_parse_profiles, _trace_device_kernel_events,
-                                  msprof_shadow_toolkit)
+                                  msprof_shadow_toolkit, profile_artifact_index)
 from fullnet.store import read_json, rows
 
 
@@ -82,18 +83,20 @@ def test_profile_requires_structural_non_cpu_device_kernel_evidence(tmp_path):
     ]}))
     device = tmp_path / "device.json"
     device.write_text(json.dumps({"traceEvents": [
-        {"name": "process_name", "ph": "M", "pid": 4, "args": {"name": "Ascend Hardware"}},
-        {"name": "rms_norm_kernel", "cat": "kernel", "ph": "X", "ts": 1, "dur": 8, "pid": 4},
+        {"name": "process_name", "ph": "M", "pid": 4,
+         "args": {"name": "Ascend Hardware", "Device Id": 0}},
+        {"name": "rms_norm_kernel", "cat": "kernel", "ph": "X", "ts": 1, "dur": 8, "pid": 4,
+         "args": {"Device Id": 0, "Task Type": "AI_CORE"}},
         {"name": "rms_norm_kernel", "cat": "kernel", "ph": "X", "ts": 1, "dur": 0, "pid": 4},
     ]}))
     assert _trace_device_kernel_events(cpu) == 0
     assert _trace_device_kernel_events(device) == 1
 
     csv_path = tmp_path / "kernel_details.csv"
-    csv_path.write_text("Kernel Name,Task Type,Duration(us)\n"
-                        "fake_cpu_kernel,CPU,10\n"
-                        "empty,AI_CORE,0\n"
-                        "rms_norm,AI_CORE,12\n")
+    csv_path.write_text("Device_id,Kernel Name,Task Type,Duration(us)\n"
+                        "0,fake_cpu_kernel,CPU,10\n"
+                        "0,empty,AI_CORE,0\n"
+                        "0,rms_norm,AI_CORE,12\n")
     assert _csv_device_kernel_rows(csv_path) == 1
 
 
@@ -104,6 +107,85 @@ def test_device_csv_requires_positive_duration_and_device_identity(tmp_path):
                         "0,AICPU,15\n"
                         "0,AI_CORE,12\n")
     assert _csv_device_kernel_rows(csv_path) == 1
+
+
+def test_compute_gate_accepts_cann_types_and_rejects_non_compute_evidence(tmp_path):
+    trace_path = tmp_path / "compute-gate.json"
+    events = [
+        {"name": "process_name", "ph": "M", "pid": 1,
+         "args": {"name": "HCCL Hardware", "Device Id": 0}},
+        {"name": "hccl_kernel", "cat": "kernel", "ph": "X", "dur": 8, "pid": 1,
+         "args": {"Device_id": 0}},
+        {"name": "process_name", "ph": "M", "pid": 2,
+         "args": {"name": "Ascend Hardware", "Device Id": 0}},
+        {"name": "cpu_submit", "cat": "cpu_op", "ph": "X", "dur": 8, "pid": 2,
+         "args": {"Device_id": 0, "Task Type": "AI_CORE"}},
+        {"name": "device_only_comm", "cat": "kernel", "ph": "X", "dur": 8, "pid": 2,
+         "args": {"Device_id": 0}},
+        {"name": "aicpu", "cat": "aicore", "ph": "X", "dur": 8, "pid": 2,
+         "args": {"Device_id": 0, "Task Type": "AICPU"}},
+    ]
+    for index, task_type in enumerate(("AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV")):
+        events.append({"name": f"compute_{index}", "cat": "kernel", "ph": "X", "dur": 8,
+                       "pid": 2, "args": {"Device_id": 0, "Task Type": task_type}})
+    for value in (0, "nan", "inf"):
+        events.append({"name": "bad_duration", "cat": "kernel", "ph": "X", "dur": value,
+                       "pid": 2, "args": {"Device_id": 0, "Task Type": "AI_CORE"}})
+    trace_path.write_text(json.dumps({"traceEvents": events}))
+    assert _trace_device_kernel_events(trace_path) == 4
+
+    csv_path = tmp_path / "op_summary.csv"
+    rows = [
+        ("1", "AI_CORE", "2"), ("1", "AI_VECTOR_CORE", "3"),
+        ("1", "MIX_AIC", "4"), ("1", "MIX_AIV", "5"),
+        ("1", "HCCL", "6"), ("1", "AICPU", "7"),
+        ("1", "COMMUNICATION", "8"), ("1", "AI_CORE", "0"),
+        ("1", "AI_CORE", "nan"), ("1", "AI_CORE", "inf"),
+    ]
+    csv_path.write_text("Device_id,Task Type,Task Duration(us),Op Name\n" +
+                        "".join(f"{device},{task},{duration},op\n" for device, task, duration in rows))
+    assert _csv_device_kernel_rows(csv_path) == 4
+
+    device_only = tmp_path / "device-only-communication.csv"
+    device_only.write_text("Device_id,Task Duration(us),Op Name\n1,8,communication\n")
+    assert _csv_device_kernel_rows(device_only) == 0
+
+
+def test_profile_artifact_index_discovers_extra_timeline_forms_deduplicates_and_rejects_cpu(tmp_path):
+    run = tmp_path / "run"
+    extra = run / "offline-export"
+    extra.mkdir(parents=True)
+    events = {"traceEvents": [
+        {"name": "process_name", "ph": "M", "pid": 7,
+         "args": {"name": "NPU Device 1"}},
+        {"name": "compute", "ph": "X", "cat": "kernel", "pid": 7,
+         "args": {"Task Type": "AI_CORE"}, "dur": 2},
+    ]}
+    (extra / "trace_view.json").write_text(json.dumps(events), encoding="utf-8")
+    (extra / "msprof_001.json").write_text(json.dumps(events), encoding="utf-8")
+    with gzip.open(extra / "rank.pt.trace.json.gz", "wt", encoding="utf-8") as handle:
+        json.dump(events, handle)
+    indexed = profile_artifact_index(run, extra_dirs=[extra, extra])
+    traces = [item for item in indexed["artifacts"] if item["kind"] == "trace"]
+    assert len(traces) == 3 and all(item["device_kernel_events"] == 1 for item in traces)
+    assert indexed["has_device_kernel_evidence"] is True
+
+    cpu = tmp_path / "cpu-run" / "offline-export"
+    cpu.mkdir(parents=True)
+    (cpu / "trace_view.json").write_text(json.dumps({"traceEvents": [
+        {"name": "cpu", "ph": "X", "cat": "cpu_op", "pid": 1,
+         "args": {"Task Type": "AI_CORE"}, "dur": 5},
+    ]}), encoding="utf-8")
+    cpu_result = profile_artifact_index(cpu.parent, extra_dirs=[cpu])
+    assert cpu_result["has_device_kernel_evidence"] is False
+    assert cpu_result["acceptance"] == "not_accepted"
+
+    bad = tmp_path / "bad-run" / "offline-export"
+    bad.mkdir(parents=True)
+    (bad / "msprof_bad.json").write_text("{broken", encoding="utf-8")
+    bad_result = profile_artifact_index(bad.parent, extra_dirs=[bad])
+    assert bad_result["has_device_kernel_evidence"] is False
+    assert bad_result["artifacts"][0]["substantive"] is False
 
 
 def test_profiler_shadow_does_not_modify_source_sdk_and_keeps_executable(tmp_path):
@@ -146,6 +228,11 @@ def test_offline_parse_keeps_first_error_and_does_not_accept_empty_trace(tmp_pat
     profiles = run / "profiles"
     (profiles / "rank0_ascend_pt" / "PROF_0").mkdir(parents=True)
     (profiles / "rank1_ascend_pt" / "PROF_1").mkdir(parents=True)
+    for rank,device in ((0,4),(1,5)):
+        data=profiles/f"rank{rank}_ascend_pt"/f"PROF_{rank}"/f"device_{device}"/"data"
+        data.mkdir(parents=True)
+        (data/"stars_soc").write_bytes(b"raw")
+    (tmp_path/"toolkit").mkdir()
     shadow = run / "performance" / "msprof-shadow"
     shadow.mkdir(parents=True)
     msprof_py = shadow / "msprof.py"
@@ -156,7 +243,7 @@ def test_offline_parse_keeps_first_error_and_does_not_accept_empty_trace(tmp_pat
         "env_updates": {},
         "shadow_toolkit": {"msprof_py": str(msprof_py)},
     }))
-    (run / "config.json").write_text(json.dumps({"service": {"argv": [sys.executable]}}))
+    (run / "config.json").write_text(json.dumps({"devices":[4,5],"service": {"argv": [sys.executable]}}))
     calls = []
 
     def fake_run(argv, **kwargs):
@@ -165,7 +252,7 @@ def test_offline_parse_keeps_first_error_and_does_not_accept_empty_trace(tmp_pat
 
     monkeypatch.setattr("fullnet.measurements.subprocess.run", fake_run)
     result = _offline_parse_profiles(run)
-    assert len(calls) == 2
+    assert len(calls) == 1  # SQLite fails before any official CLI/import or raw copy.
     assert result["first_error"] == "first offline ERROR"
     assert result["acceptance"] == "not_accepted"
 

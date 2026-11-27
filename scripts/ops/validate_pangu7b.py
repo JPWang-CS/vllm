@@ -2,7 +2,6 @@
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +10,7 @@ from fullnet.analysis import report
 from fullnet.execution import plan, run_experiment
 from fullnet.export import export_run
 from fullnet.store import experiment, read_json, rows
+from fullnet.pangu7b_device_guard import configure_pangu7b_platform_env, verify_npu_smi_output
 
 
 def main():
@@ -19,16 +19,18 @@ def main():
     p.add_argument("--runtime-root", type=Path, required=True)
     p.add_argument("--model-python", type=Path, required=True)
     p.add_argument("--weights", type=Path, required=True)
-    p.add_argument("--platform", choices=("a3", "a5"), required=True)
+    p.add_argument("--platform", choices=("a2", "a3", "a5"), required=True)
     p.add_argument("--device-index", type=int, required=True)
     p.add_argument("--npu-id", type=int, required=True)
     p.add_argument("--task", required=True)
     p.add_argument('--dataset', type=Path, help='Reuse previously frozen model-specific samples')
     p.add_argument('--keep-ready', action='store_true')
-    p.add_argument('--port', type=int, default=18321)
+    p.add_argument('--port', type=int, default=None)
     p.add_argument("--prepare-only", action="store_true", help="Prepare fixed evaluation samples without device computation")
     p.add_argument("--entrypoint-only", action="store_true", help="Check the real model entrypoint without loading weights")
     a = p.parse_args()
+    if a.port is None:
+        a.port = 18320 if a.platform == "a2" else 18321
     root = a.project.resolve(strict=True)
     task = (root / "runs" / a.task).resolve(strict=True)
     if not task.is_relative_to(root):
@@ -56,8 +58,7 @@ def main():
                ASCEND_RT_VISIBLE_DEVICES=str(a.device_index), ASCEND_VISIBLE_DEVICES=str(a.device_index),
                VLLM_USE_V1="1", VLLM_WORKER_MULTIPROC_METHOD="spawn", VLLM_PLUGINS="omni-npu,omni_custom_models,omni_npu_patches",
                GLOO_SOCKET_IFNAME="lo", HCCL_SOCKET_IFNAME="lo")
-    if a.platform == "a5":
-        env["ASCEND_COMPUTE_UNIT"] = "ascend950"
+    env = configure_pangu7b_platform_env(env, a.platform)
     if env.get("FULLNET_CA_BUNDLE"):
         for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT"):
             env[key] = env["FULLNET_CA_BUNDLE"]
@@ -73,10 +74,9 @@ def main():
     def guard(label):
         r = subprocess.run([str(root / "tools/npu-smi"), "info"], env=env, capture_output=True, text=True, timeout=30)
         (task / (label + ".txt")).write_text(r.stdout+r.stderr)
-        if r.returncode or not re.search(r"\|\s*"+str(a.npu_id)+r"\s+\|?\s*Ascend\w*\s*\|\s*OK\b",r.stdout):
-            raise RuntimeError("target device health unconfirmed")
-        if "No running processes found in NPU " + str(a.npu_id) + " " not in r.stdout:
-            raise RuntimeError("target device is occupied or process visibility unconfirmed")
+        if r.returncode:
+            raise RuntimeError("target device health unconfirmed: npu-smi failed")
+        verify_npu_smi_output(r.stdout, a.platform, a.npu_id)
     status={"model":"pangu-7b","platform":a.platform,"model_inference":"not_run","quality_on_real_model":"not_run"}
     run=None
     try:

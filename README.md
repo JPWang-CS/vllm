@@ -25,7 +25,7 @@ cd fullnet-lab
 请阅读 AGENTS.md，使用项目 Skill 完成模型部署与验证。
 
 模型：模型名称、发布版本或已有权重目录
-硬件：设备型号、可使用的设备，以及 A3/A5 平台
+硬件：设备型号、可使用的设备，以及 A2/A3/A5 平台
 工作范围：目标连接、个人容器和项目目录
 运行环境：已有模型 Python 环境与 CANN 入口；也可由你核对后准备项目私有环境
 评测目标：使用指定数据集；已有评测协议时沿用其输入、生成参数和评分规则
@@ -36,7 +36,7 @@ cd fullnet-lab
 在指定容器和项目目录中工作，复用现有环境，并保留每次尝试的记录。
 ```
 
-AI 会根据实际模型和运行时准备配置。仓库提供 Ascend A3/A5 配置入口；部署参数、模型适配和 profiler 由所选环境决定。模型安装、权重获取和数据准备见 [从零准备环境与模型](docs/from-zero.md)。
+AI 会根据实际模型和运行时准备配置。仓库提供 Ascend A2/A3/A5 配置入口；部署参数、模型适配和 profiler 由所选环境决定。A2、A3、A5 的基础功能都要在目标平台上重新完成健康、映射、启动、短请求和固定评测；平台之间不直接复用设备或性能结果。模型安装、权重获取和数据准备见 [从零准备环境与模型](docs/from-zero.md)。
 
 ### 3. 查看结果并继续任务
 
@@ -58,6 +58,18 @@ AI 会根据实际模型和运行时准备配置。仓库提供 Ascend A3/A5 配
 ![Fullnet Lab 部署与验证工作流](docs/assets/fullnet-workflow.png)
 
 AI 先读取项目规则、模型说明和对应 Skill，再核对原始配置、运行时加载路径、权重、设备健康与空闲状态。随后固定输入和生成协议，独立完成真实短生成、固定评测、服务性能和设备 profile；每个阶段保留原始日志、退出码和失败原因。修改或算子替换必须创建独立实验，并与原生基线使用相同条件对照。
+
+公开 CLI 的阶段入口是：
+
+```bash
+fullnet run --model <model> --run <run> [--profile] [--performance]
+fullnet run --model <model> --run <run> --pd-probe mixed
+fullnet run --model <model> --run <run> --pd-probe split
+```
+
+`--pd-probe split` 在固定评测前检查 KV 交接；`--pd-probe mixed`、`--profile` 和 `--performance` 在固定评测通过后执行。前两个 flag 要求冻结配置中已经有合法的 `measurements`；`--profile` 还要求服务端 profiler 已在配置中启用。修改这些字段后必须重新执行 `fullnet plan`，不能对已经开始的实验临时补配置。`mixed` 只适用于同一服务实例确实能提供混合 P/D 证据；`split` 需要实际的 producer/consumer、KV-transfer 和 `/metrics_snapshot` 适配器，普通单服务配置不能直接使用。
+
+真实设备运行时，配置中的 `devices` 是进程使用的 runtime/logical device selector，不等同于 `npu-smi` 的物理 board ID。A2/A3/A5 运行前都要取得当前 host 上的物理到 runtime/ACL 映射，再重新确认目标设备健康、空闲且没有本任务外的进程；这次 fresh gate 通过后才可启动模型。换卡或换平台必须建立新的实验。
 
 ## 可以完成哪些工作
 
@@ -107,6 +119,8 @@ fullnet report --model workflow-fixture --run workflow-001
 ```
 
 每次任务的配置、输入、日志、输出和报告都保存在项目目录。结果查看与后续分析可以继续交给 AI；后台任务提交与恢复见 [长任务与 AI 执行](docs/background-jobs.md)。
+
+`fullnet run` 的退出码 0 表示框架任务和评测协议完成，并不自动表示质量通过。评分阈值为 `null` 时，结果会保留 `quality_status=not_specified`；外部 CI 或交付脚本必须同时检查结果中的 `protocol_pass`、`quality_status`、profile、performance 和 cleanup 状态。只有明确的质量阈值满足后，才能把质量记为 `passed`。
 
 ## 使用文档
 

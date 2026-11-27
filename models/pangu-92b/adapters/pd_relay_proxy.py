@@ -36,6 +36,7 @@ import uvicorn
 UPSTREAM_TIMEOUT = 6 * 60 * 60
 STATE = {"urls": {}, "stats": Counter(), "last": {}}
 EXPECTED_MODEL = "pangu-92b"
+PREFILL_REQUEST_ID_HEADER = "X-Fullnet-Prefill-Request-Id"
 app = FastAPI()
 
 
@@ -83,6 +84,27 @@ def model_ids(payload, expected_model=EXPECTED_MODEL):
         return ids
     except (TypeError, ValueError, KeyError, json.JSONDecodeError):
         return None
+
+
+def extract_runtime_kv_transfer_params(payload):
+    """Extract opaque runtime metadata; never synthesize a fallback."""
+    try:
+        value = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+        params = value.get("kv_transfer_params")
+    except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(params, dict):
+        return None
+    request_id = params.get("prefill_req_id")
+    # Preserve the runtime's opaque ID exactly, including through an HTTP header.
+    if (not isinstance(request_id, str) or not request_id or request_id != request_id.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in request_id)):
+        return None
+    try:
+        request_id.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+    return params
 
 
 def readiness_result(results, expected_model=EXPECTED_MODEL):
@@ -147,11 +169,8 @@ async def chat(request: Request):
         note("prefill_failed", "%s %s" % (status, payload[:400]))
         return JSONResponse(status_code=502, content={"error": "prefill stage failed",
             "upstream_status": status, "upstream_body": payload.decode(errors="replace")[:2000]})
-    try:
-        params = json.loads(payload).get("kv_transfer_params")
-    except Exception:
-        params = None
-    if not isinstance(params, dict) or "prefill_req_id" not in params:
+    params = extract_runtime_kv_transfer_params(payload)
+    if params is None:
         note("handoff_missing", payload[:400])
         return JSONResponse(status_code=502, content={"error":
             "producer response carried no kv_transfer_params; KV handoff did not happen"})
@@ -167,7 +186,8 @@ async def chat(request: Request):
         note("decode_failed", "%s %s" % (status, payload[:400]))
     else:
         note("handoff_ok", {"prefill_req_id": params.get("prefill_req_id")})
-    return Response(content=payload, status_code=status, media_type=media_type)
+    headers = {PREFILL_REQUEST_ID_HEADER: params["prefill_req_id"]} if status == 200 else {}
+    return Response(content=payload, status_code=status, media_type=media_type, headers=headers)
 
 
 def main():
@@ -177,10 +197,11 @@ def main():
     parser.add_argument("--prefill", required=True, help="host:port of the producer instance")
     parser.add_argument("--decode", required=True, help="host:port of the consumer instance")
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--bind-address", default="127.0.0.1")
     args = parser.parse_args()
     STATE["urls"] = {"prefill": "http://%s" % args.prefill, "decode": "http://%s" % args.decode}
     STATE["model"] = args.model
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.bind_address, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

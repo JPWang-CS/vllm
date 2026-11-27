@@ -14,7 +14,7 @@ def main():
     p.add_argument("--project", type=Path, required=True)
     p.add_argument("--runtime-root", type=Path, required=True)
     p.add_argument("--model-python", type=Path, required=True)
-    p.add_argument("--platform", choices=("a3", "a5"), required=True)
+    p.add_argument("--platform", choices=("a2", "a3", "a5"), required=True)
     p.add_argument("--device-index", type=int, required=True)
     p.add_argument("--npu-id", type=int, required=True)
     p.add_argument("--task", required=True)

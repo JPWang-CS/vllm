@@ -87,12 +87,13 @@ def test_fleet_inventory_and_asset_requests_match_broker_schema(tmp_path):
     assert set(asset_request) == {"request_id", "action", "host", "job", "script", "devices", "args", "asset"}
 
 
-def test_fleet_run_script_is_confined_to_task_repair_and_status_reads_broker_reply(tmp_path):
+def test_fleet_run_script_is_confined_to_task_repair_and_status_reads_broker_reply(tmp_path, published_source_fixture):
     root = tmp_path.resolve()
     task = root / "runs" / "matrix-task"
     repair = task / "repair"
     repair.mkdir(parents=True)
     (repair / "worker.py").write_text("print('ok')\n")
+    published_source_fixture(root, task)
     submitted = recover_framework.fleet_submit(root, task, "run-00", "run", "10.1.2.3", "pd-job",
                                                "repair/worker.py", [2, 3], ["--rank", "0"])
     request = json.loads(Path(submitted["request"]).read_text())
