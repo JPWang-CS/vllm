@@ -151,10 +151,12 @@ def remote_regular_source(remote, root, relative):
     return attrs
 
 
-def compare_active_target_source(source, source_root, target, target_root, files):
+def compare_active_target_source(source, source_root, target, target_root, files, progress=None):
     """Verify identical published files without changing an active target."""
     records, mismatches = [], []
     for relative in files:
+        if progress:
+            progress()
         path = PurePosixPath(relative)
         if path.is_absolute() or '..' in path.parts or not published_source_file_allowed(relative):
             raise ValueError('invalid published source path')
@@ -180,7 +182,7 @@ def compare_active_target_source(source, source_root, target, target_root, files
             'files':records,'mismatches':mismatches}
 
 
-def compare_control_to_snapshot(remote, project_root, receipt):
+def compare_control_to_snapshot(remote, project_root, receipt, progress=None):
     """Compare control-project core files with the published snapshot contents."""
     snapshot = _absolute_posix_path(receipt["snapshot"], "published snapshot")
     project = _absolute_posix_path(project_root, "control project")
@@ -189,6 +191,8 @@ def compare_control_to_snapshot(remote, project_root, receipt):
         raise ValueError("published snapshot must be project/runs/<publish-task>/published")
     mismatches = []
     for relative in receipt["files"]:
+        if progress:
+            progress()
         path = PurePosixPath(relative)
         if (path.is_absolute() or ".." in path.parts or not path.parts
                 or any(part in PROJECT_COPY_SKIP_DIRS - {"assets", "cache"} for part in path.parts[:-1])
@@ -795,7 +799,8 @@ class Broker:
             raise RuntimeError("broker source changed on disk; restart broker before a new run")
         files = receipt.get("files") if isinstance(receipt, dict) else None
         validated = validate_framework_receipt(receipt, files or [])
-        comparison = compare_control_to_snapshot(source, self.project, validated)
+        comparison = compare_control_to_snapshot(source, self.project, validated,
+                                                 lambda:self.heartbeat(source))
         if not comparison["matches"]:
             raise RuntimeError(
                 "control project does not match the published tracked snapshot: "
@@ -827,6 +832,18 @@ class Broker:
         with sftp.open(temp, "w") as out:
             out.write(json.dumps(value, ensure_ascii=False).encode())
         sftp.posix_rename(temp, name)
+
+    def heartbeat(self, source, force=False):
+        """Publish liveness while bounded source checks and transfers progress."""
+        now = time.time()
+        if not force and now-getattr(self,'last_heartbeat',0)<15:
+            return
+        self.helper.mkdirs(source,str(self.run/'fleet'),0o700)
+        value = {'status':'connected','at':now,'pid':os.getpid(),'task':self.task,
+                 **self.freshness()}
+        self.atomic(source,str(self.run/'fleet/broker-heartbeat.json'),value)
+        (self.local/'broker-heartbeat.json').write_text(json.dumps(value),encoding='utf8')
+        self.last_heartbeat = now
 
     def publish_target_metadata(self):
         """Publish a task-local, credential-free manifest on a fresh connection."""
@@ -993,7 +1010,8 @@ print(json.dumps(o,ensure_ascii=False))
                     check_sf = client.open_sftp()
                     try:
                         active_source = compare_active_target_source(
-                            source,self.project,check_sf,root,source_receipt['files'])
+                            source,self.project,check_sf,root,source_receipt['files'],
+                            lambda:self.heartbeat(source))
                     finally:
                         check_sf.close()
                     if not active_source['matches']:
@@ -1013,6 +1031,7 @@ print(json.dumps(o,ensure_ascii=False))
                 def copy_scripts(relative):
                     folder = source_root + "/" + relative
                     for ent in source.listdir_attr(folder):
+                        self.heartbeat(source)
                         import stat
                         rel = relative + "/" + ent.filename
                         if stat.S_ISDIR(ent.st_mode):
@@ -1053,6 +1072,7 @@ print(json.dumps(o,ensure_ascii=False))
                 if value["host"] != self.control_host and active_source is None:
                     import stat
                     for rel in source_receipt["files"]:
+                        self.heartbeat(source)
                         # Source content has just been checked against the published
                         # snapshot. Never stage untracked scripts or local config.
                         remote_regular_source(source, self.project, rel)
@@ -1153,7 +1173,9 @@ print(json.dumps(o,ensure_ascii=False))
             responses = str(self.run / "fleet/responses")
             self.helper.mkdirs(sf, requests, 0o700)
             self.helper.mkdirs(sf, responses, 0o700)
+            self.heartbeat(sf,force=True)
             for name in sorted(sf.listdir(requests)):
+                self.heartbeat(sf)
                 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.json", name):
                     continue
                 try:

@@ -35,6 +35,8 @@ def broker_fixture(tmp_path,execute):
     obj.run = tmp_path/'run'
     obj.local = tmp_path/'receipts'
     obj.local.mkdir()
+    obj.task = 'task'
+    obj.freshness = lambda:{'framework_source_receipt_schema':1,'loaded_source_matches_disk':True}
     obj.control = type('Control',(),{'open_sftp':lambda self:sf})()
     obj.helper = type('Helper',(),{'mkdirs':lambda self,fs,path,mode:Path(path).mkdir(parents=True,exist_ok=True)})()
     obj.execute = execute
@@ -136,3 +138,37 @@ def test_missing_active_source_remains_missing(tmp_path):
     assert result['matches'] is False
     assert result['mismatches'][0]['reason']=='missing'
     assert not (target/'src/sample.py').exists() and sf.writes==0
+
+
+def test_heartbeat_is_available_before_processing_a_request(tmp_path):
+    seen=[]
+    def execute(value,sf):
+        heartbeat=json.loads((broker.run/'fleet/broker-heartbeat.json').read_text())
+        seen.append(heartbeat['loaded_source_matches_disk'])
+        return {'submitted':True}
+    broker,requests=broker_fixture(tmp_path,execute)
+    request(requests,'slow-stage')
+    assert broker.poll()==1
+    assert seen==[True]
+
+
+def test_source_verification_reports_progress_without_source_writes(tmp_path):
+    source,target=source_fixture(tmp_path,b'published code\n')
+    progress=[]
+    sf=FS()
+    result=bridge.compare_active_target_source(sf,str(source),sf,str(target),
+        ['src/sample.py'],lambda:progress.append('checked'))
+    assert result['matches'] is True and progress==['checked'] and sf.writes==0
+
+
+def test_heartbeat_advances_during_transfer_progress(tmp_path):
+    broker,_=broker_fixture(tmp_path,lambda *_:{})
+    sf=broker.control.open_sftp()
+    with patch.object(bridge.time,'time',return_value=2000):
+        broker.heartbeat(sf)
+    with patch.object(bridge.time,'time',return_value=2005):
+        broker.heartbeat(sf)
+    assert json.loads((broker.local/'broker-heartbeat.json').read_text())['at']==2000
+    with patch.object(bridge.time,'time',return_value=2016):
+        broker.heartbeat(sf)
+    assert json.loads((broker.local/'broker-heartbeat.json').read_text())['at']==2016
