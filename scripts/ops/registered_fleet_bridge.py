@@ -182,6 +182,16 @@ def compare_active_target_source(source, source_root, target, target_root, files
             'files':records,'mismatches':mismatches}
 
 
+def target_source_reuse_decision(comparison, target_busy, busy_detail=''):
+    """Return the read-only reuse mode, or preserve idle sync / active wait."""
+    if comparison['matches']:
+        return comparison, ('reuse_identical_active' if target_busy else 'reuse_identical_idle')
+    if target_busy:
+        raise TargetProjectBusy(busy_detail + '; published source update is pending: '
+                                + json.dumps(comparison['mismatches'][:8]))
+    return None, None
+
+
 def compare_control_to_snapshot(remote, project_root, receipt, progress=None):
     """Compare control-project core files with the published snapshot contents."""
     snapshot = _absolute_posix_path(receipt["snapshot"], "published snapshot")
@@ -1078,9 +1088,11 @@ print(json.dumps(o,ensure_ascii=False))
             self.call(client, shlex.join(["python3", "-B", "-c", check, root]))
             self.call(client, shlex.join(["docker", "exec", con, "test", "-d", root]))
             active_source = None
+            reused_source = None
+            reused_source_mode = None
             if value["action"] == "run" and value["host"] != self.control_host:
                 try:
-                    self._target_has_active_workload(client, root, con)
+                    target_workload = self._target_has_active_workload(client, root, con)
                 except TargetProjectBusy as exc:
                     check_sf = client.open_sftp()
                     try:
@@ -1089,9 +1101,24 @@ print(json.dumps(o,ensure_ascii=False))
                             lambda:self.heartbeat(source))
                     finally:
                         check_sf.close()
-                    if not active_source['matches']:
-                        raise TargetProjectBusy(str(exc)+'; published source update is pending: '
-                            +json.dumps(active_source['mismatches'][:8])) from exc
+                    try:
+                        reused_source, reused_source_mode = target_source_reuse_decision(
+                            active_source, True, str(exc))
+                    except TargetProjectBusy as wait:
+                        raise wait from exc
+                else:
+                    # An idle target is safe to inspect before creating the job.
+                    # Reuse is read-only; mismatches deliberately fall through to
+                    # the existing synchronization path below.
+                    check_sf = client.open_sftp()
+                    try:
+                        idle_source = compare_active_target_source(
+                            source,self.project,check_sf,root,source_receipt['files'],
+                            lambda:self.heartbeat(source))
+                    finally:
+                        check_sf.close()
+                    reused_source, reused_source_mode = target_source_reuse_decision(
+                        idle_source, False)
             sf = client.open_sftp()
             try:
                 try:
@@ -1144,7 +1171,7 @@ print(json.dumps(o,ensure_ascii=False))
                     "excluded_directories": sorted(PROJECT_COPY_SKIP_DIRS),
                     "files": [],
                 }
-                if value["host"] != self.control_host and active_source is None:
+                if value["host"] != self.control_host and reused_source is None:
                     import stat
                     for rel in source_receipt["files"]:
                         self.heartbeat(source)
@@ -1193,10 +1220,10 @@ print(json.dumps(o,ensure_ascii=False))
                             if actual.read(len(data) + 1) != data:
                                 raise RuntimeError("target source failed content verification: " + rel)
                     framework_sync["status"] = "verified"
-                elif active_source is not None:
-                    framework_sync.update(status='verified',mode='reuse_identical_active',
-                        files=active_source['files'],source_writes_performed=False,
-                        target_files_checked=active_source['files_checked'])
+                elif reused_source is not None:
+                    framework_sync.update(status='verified',mode=reused_source_mode,
+                        files=reused_source['files'],source_writes_performed=False,
+                        target_files_checked=reused_source['files_checked'])
                 else:
                     framework_sync["status"] = "control_project_already_current"
                 self.atomic(sf, job + "/framework-sync.json", framework_sync)

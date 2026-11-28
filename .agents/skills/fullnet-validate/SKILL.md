@@ -32,6 +32,7 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 - CPU 准备使用最终启动参数，包括尝试编号与角色后缀。Ray 路径交给当前适配器检查完整名称、项目归属和 socket 长度。检查计划、依赖、环境、设备映射与评测合同齐全后再放行；`CPU_PREPARED` 或 exit0 本身不代表计划可启动。
 
 - 目标项目正在运行且需要更新源码时，broker 保留原请求，以 `fleet/waiting-<request>.json` 的 `WAITING_TARGET_PROJECT` 状态继续检查，不返回部署失败、不加载模型、不重复提交。若目标发布文件逐文件内容一致，broker 只读核对并复用它们，将新脚本、输入和结果写到各自作业目录；`framework-sync.json` 记录 `reuse_identical_active` 和未写源码的证据。未知错误仍按失败处理。
+- 目标项目空闲时同样先只读比较 published source；全量一致记录 `reuse_identical_idle` 并只创建本次 job。pending inventory 在兼容且新鲜 heartbeat 下复用同一 query 等待，不要把 broker staging 等待误报为 model timeout；heartbeat 失鲜、响应错误和真实模型超时分别记录。
 
 - 新任务指示写入 `OPERATOR_UPDATE.json` 后，核当前执行实际 Read 或状态查询的成功工具结果已包含对应更新 id/指示；文件落盘不代表已消费，stop 更新同样必须保留并执行。
 
