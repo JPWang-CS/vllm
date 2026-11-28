@@ -1,4 +1,5 @@
 import json
+import copy
 import os
 import socket
 import sys
@@ -218,8 +219,18 @@ def test_lock_preserves_other_writer(tmp_path):
 def test_cross_hardware_comparison_rejected(project):
     root, c = project
     left = plan(root, c, "a")
-    c["platform"] = "a3"
-    right = plan(root, c, "b")
+    hardware = copy.deepcopy(c)
+    hardware["platform"] = "a3"
+    hardware["service"]["smoke"] = {"enabled": True, "max_tokens": 1, "timeout": 1}
+    hardware["acceptance"] = {"expected_samples": 2, "preflight": {
+        "assets": {"adapter": "assets-check"},
+        "device_gate": {"adapter": "fleet-evidence", "evidence_path": "${RUN}/validation/device.json"},
+        "model_import": {"adapter": "model-import", "python": sys.executable},
+        "cleanup": {"adapter": "fleet-evidence", "evidence_path": "${RUN}/validation/cleanup.json"}}}
+    hardware["measurements"] = {"requests": 1, "warmups": 0,
+                                 "profile_workload": {"input": 1, "output": 1, "concurrency": 1},
+                                 "workloads": [{"input": 1, "output": 1, "concurrency": 1}]}
+    right = plan(root, hardware, "b")
     with pytest.raises(ValueError, match="platform"):
         comparison(left, right)
 

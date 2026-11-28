@@ -14,8 +14,11 @@ Contract implemented here:
   head_env()         env for the head-host serve process
   fixture_rendezvous()  CPU-only gloo proof of the rank map (fixture; per the
                      acceptance contract it does NOT count as device acceptance)
-  rank_evidence()    parse service log + placement table for real cross-host
-                     rank proof (>= 2 distinct hosts)
+  collect_actor_rank_evidence()  read only the current case's Ray actor logs
+                                 for rank/world/model-loading facts
+  rank_evidence()    validate the actor evidence against the current case
+                     role/host/rank/model contract; service/placement text is
+                     supplementary and can never prove a rank by itself
 """
 import json
 import os
@@ -664,14 +667,277 @@ def fixture_rendezvous(plan_value, out_dir, port=29671):
     return verdict
 
 
-def rank_evidence(service_log_text, placement_table_text):
-    """Real cross-host rank proof for acceptance: >= 2 distinct worker hosts in
-    the service log AND a placement group whose bundles span 2 nodes."""
-    hosts = sorted(set(_HOST_RE.findall(service_log_text)))
-    nodes = sorted(set(_HOST_RE.findall(placement_table_text)))
-    return {"worker_hosts": hosts, "distinct_hosts": len(hosts),
-            "placement_nodes": nodes,
-            "has_cross_host_ranks": len(hosts) >= 2 and len(nodes) >= 2}
+_RANK_WORLD_RE = re.compile(
+    r"(?:\brank\s+(?P<rank_a>\d+)\s+in\s+world\s+size\s+(?P<world_a>\d+)\b|"
+    r"\bworld_size\s*=\s*(?P<world_b>\d+)\s+rank\s*=\s*(?P<rank_b>\d+)\b)", re.I)
+_WEIGHTS_RE = re.compile(
+    r"(?:\bweights?\s+(?:were\s+)?loaded\b|\bloaded\s+weights?\b|"
+    r"\bloading\s+weights?\s+took\b|\bmodel\s+loading\s+took\b)", re.I)
+
+
+def _rank_world_values(match):
+    """Return global rank/world only; never consume local_rank or node_rank."""
+    rank = match.group("rank_a") or match.group("rank_b")
+    world = match.group("world_a") or match.group("world_b")
+    return int(rank), int(world)
+
+
+def _case_path(project_root, raw, label):
+    """Resolve one declared actor-log root without widening the read scope."""
+    root = pathlib.Path(project_root).resolve(strict=True)
+    lexical = pathlib.Path(raw)
+    if not lexical.is_absolute():
+        lexical = root / lexical
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes project root: {lexical}") from exc
+    current = root
+    for part in relative.parts:
+        if current.is_symlink():
+            raise ValueError(f"{label} has a symlink parent: {current}")
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} has a symlink component: {current}")
+    path = lexical.resolve(strict=False)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes project root: {path}") from exc
+    return path
+
+
+def _actor_log_records(project_root, role, host, task_id, expected_ranks,
+                       expected_world, model, log_root=None, tail_bytes=262144,
+                       case_id=None, job=None, request_id=None):
+    """Collect rank facts from exactly one current-case Ray role directory.
+
+    The collector deliberately does not recurse from the project root.  It
+    only reads ``session_*/logs/worker-*.out`` below the role's declared Ray
+    task directory, preserving the original paths in the evidence.
+    """
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("actor role is required")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("actor host is required")
+    if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", task_id):
+        raise ValueError("actor task_id is unsafe")
+    if type(expected_world) is not int or expected_world < 1:
+        raise ValueError("expected_world must be a positive integer")
+    expected_ranks = {int(value) for value in expected_ranks}
+    if not expected_ranks or any(value < 0 or value >= expected_world for value in expected_ranks):
+        raise ValueError("expected_ranks must be inside expected_world")
+    role_root = _case_path(project_root, pathlib.Path(".r") / f"{task_id}-{role}",
+                           "current actor role root")
+    base = (_case_path(project_root, log_root, "actor log root") if log_root is not None
+            else role_root)
+    try:
+        base.relative_to(role_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"actor log root is not under current role task directory: {base}"
+        ) from exc
+    records = []
+    paths = []
+    ranks = set()
+    worlds = set()
+    rank_facts = {}
+    completion_facts = []
+    weights_loaded = False
+    if base.is_dir():
+        logs = sorted(
+            (item for item in base.glob("session_*/logs/worker-*.out")
+             if item.is_file() and not item.is_symlink()),
+            key=lambda item: item.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for log in logs:
+            try:
+                with log.open("rb") as stream:
+                    stream.seek(max(0, log.stat().st_size - tail_bytes))
+                    text = stream.read().decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            matches = list(_RANK_WORLD_RE.finditer(text))
+            loaded = bool(_WEIGHTS_RE.search(text))
+            if not matches and not loaded:
+                continue
+            values = [_rank_world_values(match) for match in matches]
+            log_ranks = sorted({rank for rank, _ in values})
+            log_worlds = sorted({world for _, world in values})
+            ranks.update(log_ranks)
+            worlds.update(log_worlds)
+            weights_loaded = weights_loaded or loaded
+            path_text = str(log)
+            paths.append(path_text)
+            completed_lines = [line[:800] for line in text.splitlines()
+                               if _WEIGHTS_RE.search(line)]
+            if completed_lines:
+                completion_facts.append({
+                    "path": path_text, "ranks": log_ranks,
+                    "lines": completed_lines, "weights_loaded": True,
+                })
+            for match in matches:
+                rank, world = _rank_world_values(match)
+                fact = {
+                    "rank": rank, "world_size": world,
+                    "host": host, "role": role, "model": model,
+                    "weights_loaded": loaded, "path": path_text,
+                    "case_id": case_id, "job": job,
+                    "request_id": request_id,
+                }
+                previous = rank_facts.get(str(rank))
+                if previous is None or (loaded and not previous["weights_loaded"]):
+                    rank_facts[str(rank)] = fact
+            records.append({
+                "role": role, "host": host, "task_id": task_id,
+                "path": path_text, "ranks": log_ranks,
+                "world_sizes": log_worlds, "weights_loaded": loaded,
+                "rank_facts": {str(rank): rank_facts[str(rank)] for rank in log_ranks},
+                "model": model, "case_id": case_id, "job": job,
+                "request_id": request_id,
+                "tail_bytes": min(tail_bytes, log.stat().st_size),
+            })
+            if expected_ranks.issubset(ranks) and weights_loaded:
+                break
+    return {
+        "role": role, "host": host, "task_id": task_id,
+        "model": model, "case_id": case_id, "job": job,
+        "request_id": request_id, "log_root": str(base),
+        "log_paths": paths, "records": records,
+        "ranks": sorted(ranks), "world_sizes": sorted(worlds),
+        "weights_loaded": weights_loaded,
+        "weights_loaded_ranks": sorted(int(rank) for rank, fact in rank_facts.items()
+                                        if fact["weights_loaded"]),
+        "rank_facts": rank_facts,
+        "completion_facts": completion_facts,
+        "expected_ranks": sorted(expected_ranks), "expected_world": expected_world,
+    }
+
+
+def collect_actor_rank_evidence(project_root, role_specs, *, case_id=None,
+                                model=None, tail_bytes=262144):
+    """Collect actor evidence for the declared roles of the current case.
+
+    ``role_specs`` is a mapping whose values contain ``host``, ``task_id``,
+    ``expected_ranks`` and ``expected_world``.  Optional ``log_root``,
+    ``job`` and ``request_id`` are copied into the evidence for identity
+    binding.  No placement table or service log is read here.
+    """
+    if not isinstance(role_specs, dict) or not role_specs:
+        raise ValueError("role_specs must be a non-empty mapping")
+    result = []
+    for role in sorted(role_specs):
+        spec = role_specs[role]
+        if not isinstance(spec, dict):
+            raise ValueError(f"role spec is not an object: {role}")
+        if model is not None and spec.get("model") != model:
+            raise ValueError(f"role model differs from case model: {role}")
+        result.append(_actor_log_records(
+            project_root, role, spec["host"], spec["task_id"],
+            spec["expected_ranks"], spec["expected_world"], spec["model"],
+            spec.get("log_root"), tail_bytes, case_id,
+            spec.get("job"), spec.get("request_id")))
+    return result
+
+
+def rank_evidence(service_log_text="", placement_table_text="", *,
+                  actor_records=None, expected_ranks=None, expected_world=None,
+                  expected_hosts=None, expected_model=None,
+                  expected_rank_hosts=None, case_id=None):
+    """Validate real cross-host rank evidence for the current case.
+
+    Actor records are mandatory for ``has_cross_host_ranks``.  The legacy
+    service-log/placement arguments remain accepted so old callers can keep
+    recording their paths, but those strings are supplementary and never
+    establish rank, host, world size or model loading.
+    """
+    service_log_text = service_log_text or ""
+    placement_table_text = placement_table_text or ""
+    service_hosts = sorted(set(_HOST_RE.findall(service_log_text)))
+    placement_nodes = sorted(set(_HOST_RE.findall(placement_table_text)))
+    expected_hosts = set(expected_hosts or ())
+    expected_ranks = set(expected_ranks or ())
+    rank_hosts = dict(expected_rank_hosts or {})
+    role_records = actor_records if isinstance(actor_records, list) else []
+    observed_hosts = set()
+    observed_ranks = set()
+    observed_worlds = set()
+    loaded_models = set()
+    rank_facts = {}
+    source_paths = []
+    reasons = []
+    for envelope in role_records:
+        if not isinstance(envelope, dict):
+            reasons.append("actor evidence envelope is not an object")
+            continue
+        host = envelope.get("host")
+        if host not in expected_hosts:
+            reasons.append(f"actor host is not declared for this case: {host!r}")
+        if case_id is not None and envelope.get("case_id") != case_id:
+            reasons.append(f"actor case identity mismatch for host {host!r}")
+        if expected_model is not None and envelope.get("model") != expected_model:
+            reasons.append(f"actor model identity mismatch for host {host!r}")
+        for rank, fact in (envelope.get("rank_facts") or {}).items():
+            if not isinstance(fact, dict):
+                reasons.append(f"rank {rank} fact is not an object")
+                continue
+            try:
+                rank_number = int(rank)
+            except (TypeError, ValueError):
+                reasons.append(f"rank key is invalid: {rank!r}")
+                continue
+            if not fact.get("path") or not isinstance(fact.get("path"), str):
+                reasons.append(f"rank {rank_number} has no real actor log path")
+            if fact.get("host") != host:
+                reasons.append(f"rank {rank_number} fact host differs from envelope host")
+            if fact.get("case_id") != case_id and case_id is not None:
+                reasons.append(f"rank {rank_number} actor case identity mismatch")
+            if expected_model is not None and fact.get("model") != expected_model:
+                reasons.append(f"rank {rank_number} actor model identity mismatch")
+            observed_hosts.add(host)
+            observed_ranks.add(rank_number)
+            observed_worlds.add(fact.get("world_size"))
+            rank_facts[str(rank_number)] = fact
+            if fact.get("weights_loaded") is True:
+                loaded_models.add(fact.get("model"))
+        source_paths.extend(envelope.get("log_paths") or ())
+        for record in envelope.get("records") or ():
+            if not isinstance(record, dict):
+                reasons.append("actor log record is not an object")
+                continue
+            for rank in record.get("ranks") or ():
+                if rank_hosts and rank_hosts.get(str(rank), rank_hosts.get(rank)) != host:
+                    reasons.append(f"rank {rank} is bound to the wrong host")
+    if not role_records:
+        reasons.append("current-case Ray actor evidence is missing")
+    if expected_ranks and observed_ranks != expected_ranks:
+        reasons.append(f"actor ranks {sorted(observed_ranks)} != expected {sorted(expected_ranks)}")
+    if expected_world is not None and observed_worlds != {expected_world}:
+        reasons.append(f"actor world sizes {sorted(observed_worlds)} != expected {expected_world}")
+    if expected_hosts and observed_hosts != expected_hosts:
+        reasons.append(f"actor hosts {sorted(observed_hosts)} != expected {sorted(expected_hosts)}")
+    if expected_ranks and set(rank_facts) != {str(rank) for rank in expected_ranks}:
+        reasons.append("each expected rank must have exactly one current actor fact")
+    for rank in expected_ranks:
+        fact = rank_facts.get(str(rank))
+        if not fact or fact.get("weights_loaded") is not True:
+            reasons.append(f"rank {rank} lacks explicit weights-loaded evidence")
+    if expected_model is not None and loaded_models != {expected_model}:
+        reasons.append("weights-loaded evidence is not bound to the current case model")
+    has_cross_host = not reasons and len(observed_hosts) >= 2
+    return {
+        "worker_hosts": sorted(observed_hosts),
+        "distinct_hosts": len(observed_hosts),
+        "actor_ranks": sorted(observed_ranks),
+        "actor_world_sizes": sorted(observed_worlds),
+        "loaded_models": sorted(value for value in loaded_models if value is not None),
+        "actor_log_paths": source_paths,
+        "service_log_hosts": service_hosts,
+        "placement_nodes": placement_nodes,
+        "evidence_reasons": reasons,
+        "has_cross_host_ranks": has_cross_host,
+    }
 
 
 _HOST_RE = re.compile(

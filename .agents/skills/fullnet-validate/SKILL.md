@@ -63,6 +63,8 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 
 ## 并行任务与启动握手
 
+跨机新 case 复用 `scripts/ops/cross_host_case.py` 的 inventory、select、submit、status、rank-evidence 和 requeue。角色本地通过 `scripts/ops/cross_host_role.py` 收集并发布 actor evidence。参数和角色输入见 [部署验证](../../../docs/deployment-validation.md#多卡多机和-pd)。候选 CPU 准备、两次 fresh inventory 与当前 request/job 结果使用原件；rank 和资源重排逻辑由正式入口处理。
+
 模型、任务目录、端口和输出目录必须分别分配并记录；不同任务不得复用同一可写输出或运行资源。源码/依赖上传使用原子 staging，未完成的副本不能进入启动流程。
 
 跨机作业使用 `repair/worker.dependencies.json` 为 `repair/worker.py` 声明非代码输入，或使用 `repair/staging-manifest.json`。清单名不带 `.py`，内容为 `{"files":["repair/data/config.json","repair/data/all.jsonl"]}`。启动前检查实际作业的 `staging-dependencies.json`：配置、评测数据、两端环境和设备映射证据均已列出并验证。先在实际作业目录完成 CPU prepare，再启动设备阶段；本地清单检查不能代替远端文件到位检查。
@@ -73,14 +75,18 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 
 ## 固定恢复/验收顺序
 
-对每个 case 固定执行：**资料齐全 → 插件加载后的真实模型类导入 → 新鲜物理/逻辑/进程内设备映射及健康空闲 → 模型 smoke → P/D 真实 KV 检查（适用时）→ 冻结样本精度（当前盘古为 48 条）→ profile/timeline → cleanup**。阶段之间不得用旧报告、heartbeat、历史 `device-post.txt` 或父进程 exit 0 代替当前证据。
+新计划使用正式 CLI 的阶段合同，见 [实验阶段与验收](../../../docs/acceptance-contract.md)。`fullnet plan` 固定必做项，`run`、`status`、`report` 使用同一份合同和当前实验的证据。先验证功能时在 plan 阶段使用 `--quality-only`；已有实验继续读取原记录。
+
+模型退出后由外层工具取得新鲜清理回执，再执行 `fullnet verify --model <model> --run <run>`。此入口复核原始结果和资源释放，不重新启动模型；只有完整验收为 `ACCEPTED` 才返回 0。
+
+每个 case 依次执行：**资产与依赖 → 新鲜设备映射、健康与空闲 → 插件加载后的真实模型类导入 → 模型 smoke → P/D 真实 KV 检查（适用时）→ 冻结评测（当前盘古为 48 条）→ 性能及 profile/timeline → cleanup**。预检记录当前实验、设备、实际 Python、注册类和源码位置。质量阈值未设时完成评测并保存分数，`quality_status=not_specified`；`business_acceptance` 记录尚未满足的条件。
 
 每个 case 的业务 checkpoint 使用稳定的顶层 `cases` 映射；每项至少记录 `status`、真实 `job`/`request`、`experiment` 和 `next_action`。恢复优先读取业务 checkpoint，不以 controller/broker heartbeat 推断业务已结束。读取器兼容旧或模型生成的顶层 `four_types`，但空 `cases` 不得遮蔽非空 `four_types`；两者均不存在或结构非法时必须显示错误。不要再引入其他 checkpoint 形态。
 
 以下边界已有代码检查，模型与设备步骤仍须逐项执行并留证：
 
 - `recover_framework.py` 的 Python 函数调用可用 `devices=[]` 表示无设备任务；CLI 不要写 `--devices []`（`[]` 不是整数，会被 argparse 拒绝）。CPU 诊断照抄：`python3 -B scripts/ops/recover_framework.py --project <project> --task <task> --action fleet-submit --request-id <id> --fleet-action run --host <host> --job <job> --fleet-script repair/<probe>.py --devices --args-json '["--cpu-only"]'`；设备任务写成 `--devices 1 2 ...`；省略整个 `--devices` 必须在写队列前失败。请求文件采用任务目录内的原子写。fleet runner 会在设备任务执行前检查健康和空闲，broker 会检查 protected devices；业务状态读取与 controller/broker 心跳分离。
-- 真实模型类导入、映射与健康/空闲复核、smoke、适用的 P/D KV 检查、48 条精度、profile/timeline、清理核验、阈值记录和 checkpoint 写入仍需执行者按上述顺序完成。质量阈值未指定时记录 `quality_status=not_specified`，不得修改样本或阈值来制造通过。
+- 新 plan 的预检、smoke、适用的 KV 检查和测量按阶段合同执行。执行者检查原始请求、设备数据和资源释放证据，处理具体失败；阶段缺项保留 `INCOMPLETE` 与原因。旧实验按原记录独立复核。
 
 `fleet/responses/<run-request>.json` 中的 `submitted=true` 表示远端作业已创建；必须另发 status request，再读取该 job 的 `state`、`exit`、`failure` 与结果文件，才能判断阶段结果。Bash 使用管道时启用 `pipefail`，禁止用 `head`、`|| true` 或末端命令的 0 掩盖上游失败；有界输出沿用现有 helper。
 

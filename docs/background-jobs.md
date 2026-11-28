@@ -42,6 +42,8 @@ python -B scripts/ops/submit_job.py \
 
 broker heartbeat 只说明 broker 仍可报告状态，不说明模型服务、评测或 profile 正在运行。需要以 `job-state.json`、`job-exit.txt`、业务日志、实验状态、端口和设备查询共同判断。
 
+新实验的 `acceptance.json` 汇总必做阶段及其证据。`execution_completed`、`quality_status` 和 `business_acceptance` 分别表示协议完成、评分结论和完整验收，具体含义见[实验阶段与验收](acceptance-contract.md)。旧实验继续展示原记录。
+
 ## 恢复与停止
 
 恢复前先检查原任务状态、对应 tmux 会话、业务进程、端口和设备。不要重复提交仍在运行或状态未确认的 task；新尝试使用新的实验编号，保留已经冻结的配置和输入。

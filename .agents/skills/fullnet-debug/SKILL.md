@@ -46,7 +46,13 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 
 ## 固定诊断顺序与证据边界
 
-按 **资料齐全 → 插件加载后的真实模型类导入 → 新鲜物理/逻辑/进程内映射与健康空闲 → 模型 smoke → P/D 真实 KV 检查（适用时）→ 冻结样本精度（当前盘古为 48 条）→ profile/timeline → cleanup** 推进。每个 case 都在业务 checkpoint 的 `cases` 下记录 `status`、真实 `job`/`request`、`experiment`、`next_action`；恢复读 checkpoint，不用 heartbeat 代替业务状态。读取器只为兼容旧现场接受顶层 `four_types`，空 `cases` 不得覆盖非空 `four_types`，缺字段或非法结构必须报错。
+新计划按[实验阶段与验收](../../../docs/acceptance-contract.md)执行：**资产与依赖 → 新鲜设备映射、健康与空闲 → 插件加载后的真实模型类导入 → 模型 smoke → P/D 真实 KV 检查（适用时）→ 冻结评测（当前盘古为 48 条）→ 性能与 profile/timeline → cleanup**。每个 case 都在业务 checkpoint 的 `cases` 下记录 `status`、真实 `job`/`request`、`experiment`、`next_action`。恢复先读业务 checkpoint。读取器兼容旧现场的 `four_types`，空 `cases` 会继续读取非空 `four_types`；结构错误直接报错。
+
+### 跨机日志收集与资源续接
+
+新 case 使用 `scripts/ops/cross_host_case.py` 的正式阶段入口；角色本地使用 `scripts/ops/cross_host_role.py`，将同一 actor 文件中的 global rank/world 和加载完成记录发布到当前 job。`world_size=2 rank=1 local_rank=0` 中的 global rank 是 1；`Loading weights took ...` 和 `Model loading took ...` 表示加载完成。收集器使用原始日志回归，单独记录开始加载的文本。
+
+资源变化时，先区分尚未入队的意向和已提交作业。前者撤回意向后回原队列；后者通过正式 requeue 入口核对当前 request/job、模型未开始、资源失败和各角色清理记录。已有活动作业接回原请求，业务首错进入调试流程。
 
 ### P/D 请求成功但传输失败
 
@@ -56,7 +62,7 @@ P/D 在 smoke 后先用真实请求检查 KV，再进入固定评测。按同一
 
 设备映射统一使用 `fullnet.device_mapping`：`Chip Phy-ID` 关联 host-bound ACL runtime，`Slot ID`、`Chip ID` 和 `Chip Logic ID` 只作原始字段，不能作为 runtime fallback；ACL 证据必须带实际 host、指定 API、`rc=0` rows 和 `visible_unset=true`，缺失或重复映射即停止。
 
-代码已硬性拦截：Python `fleet_submit(..., devices=[])` 才表示无设备诊断；CLI 不要写 `--devices []`，应写 `--devices --args-json '["--cpu-only"]'`（`--devices` 后零个整数），设备任务写 `--devices 1 2 ...`，省略整个 `--devices` 会在写队列前失败。runner 的设备任务有健康/空闲门；broker 目标清单只发布脱敏白名单并校验任务路径边界；业务 checkpoint 与 controller/broker liveness 分开读取。GLM 仍必须实际完成并记录 runtime import、映射、smoke、48 条精度、profile/timeline、清理和阈值判断，不能把文档步骤当作已经自动执行的硬门，也不把普通诊断强行纳入完整模型合同。
+CPU 诊断在 Python 中使用 `fleet_submit(..., devices=[])`；CLI 使用 `--devices --args-json '["--cpu-only"]'`，即 `--devices` 后零个整数。设备任务显式写 `--devices 1 2 ...`，省略设备合同会在入队前失败。runner 检查设备健康与空闲，broker 校验目标清单与任务路径。新 plan 的模型预检、smoke、P/D 检查和测量由 CLI 按合同串联，GLM 据原始结果定位失败并继续未完成阶段；普通 CPU 诊断使用自己的任务合同。
 
 ### 有界首错提取
 

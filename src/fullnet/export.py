@@ -13,7 +13,7 @@ def export_run(root, run, destination):
     parent = destination.parent.resolve(strict=True)
     ownership = parent.stat()
     destination.mkdir(mode=0o700)
-    names = ("config.json", "dataset.jsonl", "changes.json", "state.json", "process.json", "results.json",
+    names = ("config.json", "dataset.jsonl", "changes.json", "state.json", "acceptance.json", "process.json", "results.json",
              "report.md", "final-report.md", "commands.jsonl", "raw/predictions.jsonl", "evaluation-progress.json", "smoke.json",
              "performance/summary.json", "performance/profile-artifacts.json", "validation.json")
     for name in names:

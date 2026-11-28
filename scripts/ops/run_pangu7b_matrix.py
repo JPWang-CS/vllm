@@ -7,12 +7,19 @@ Identity and service argv are frozen exactly as in validate_pangu7b.py.
 """
 import argparse, json, os, subprocess, sys
 from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from fullnet.analysis import report
 from fullnet.execution import plan, run_experiment
 from fullnet.export import export_run
 from fullnet.measurements import collect_performance, collect_profile
 from fullnet.pangu7b_device_guard import configure_pangu7b_platform_env, verify_npu_smi_output
 from fullnet.store import read_json, rows, write_json
+from scripts.ops.runner_acceptance import (load_acceptance_config, plan_with_acceptance,
+                                            update_result_status)
 
 WORKLOADS = [
     {"input": 128, "output": 128, "concurrency": 1},
@@ -47,6 +54,8 @@ def main():
     p.add_argument("--dataset", type=Path, help="Reuse previously frozen 48-sample subset")
     p.add_argument("--keep-ready", action="store_true")
     p.add_argument("--quality-only", action="store_true", help="Run fixed 48-sample functional/accuracy stage only")
+    p.add_argument("--acceptance-config", type=Path, required=True,
+                   help="Current task-local full config containing acceptance and preflight")
     a = p.parse_args()
     if a.port is None:
         # Preserve the historical a3/a5 default while giving A2 its own local endpoint.
@@ -55,6 +64,8 @@ def main():
     task = (root / "runs" / a.task).resolve(strict=True)
     if not task.is_relative_to(root):
         raise ValueError("task outside project")
+    acceptance, _ = load_acceptance_config(a.acceptance_config, task,
+                                           expected_samples=48, quality_only=a.quality_only)
     env = os.environ.copy()
     runtime = a.runtime_root.resolve(strict=True)
     sources = [runtime / "source/image/opt/vllm", runtime / "source/image/workspace/omniinfer/components/omni-npu/src",
@@ -187,14 +198,18 @@ def main():
                             "metric": "ruler_official", "official_metrics": str(ruler / "scripts/eval/synthetic/constants.py"),
                             "context_limit": 16384, "seed": 42, "temperature": 0, "top_p": 1,
                             "chat_template_kwargs": {}, "add_special_tokens": False, "minimum_score": None},
-             "measurements": {"requests": 32, "warmups": 2,
+              "acceptance": acceptance,
+              "measurements": {"requests": 32, "warmups": 2,
                               "deferred_stages": ["profile", "performance"] if a.quality_only else [],
                               # Orchestration ceiling only; contract identical to the 92B runner.
-                              "timeout_per_group": 21600, "workloads": WORKLOADS}}
+                               "timeout_per_group": 21600,
+                               "profile_workload": {"input": 4096, "output": 128, "concurrency": 1},
+                               "workloads": WORKLOADS}}
         status["stage"] = "device-before-launch"
         guard("device-before-launch")
         os.environ.update(env)
-        run = plan(root, c, a.task)
+        run = plan_with_acceptance(plan, root, c, a.task, acceptance,
+                                   quality_only=a.quality_only)
 
         def finished(path, config, result):
             status.update(model_requests="completed", score=result["score"], quality_status=result["quality_status"],
@@ -221,6 +236,13 @@ def main():
             write_json(task / "validation.json", status)
 
         result = run_experiment(root, "pangu-7b", a.task, after_evaluation=finished, keep_ready=a.keep_ready)
+        update_result_status(status, result, quality_only=a.quality_only)
+        if a.quality_only:
+            status["profile"] = "deferred_by_user"
+            status["performance_phase"] = "deferred_by_user"
+        elif result.get("quality_status") != "passed":
+            status["profile"] = "blocked_by_quality_gate"
+            status["performance_phase"] = "blocked_by_quality_gate"
         if not result["protocol_pass"]:
             raise RuntimeError("quality request protocol failed")
     except Exception as exc:

@@ -86,6 +86,8 @@ def test_quality_only_fixture_skips_profiler_but_runs_fixed_counter(tmp_path, mo
     assert result["samples"] == result["attempted"] == result["succeeded"] == 2
     assert result["failed"] == result["skipped"] == result["timeout"] == 0
     assert result["quality_status"] == "not_specified"
+    assert result["execution_completed"] is True
+    assert result["business_acceptance"] == "INCOMPLETE"
     assert state["phases"]["profile"]["status"] == "deferred_by_user"
     assert state["phases"]["performance"]["status"] == "deferred_by_user"
     assert state["phases"]["cleanup"]["status"] == "process_group_signalled"

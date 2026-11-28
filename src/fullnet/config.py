@@ -53,6 +53,26 @@ def resolve(path, root):
         raise ValueError("evaluation.context_limit must be positive")
     if not isinstance(evaluation.get("chat_template_kwargs", {}), dict):
         raise ValueError("chat_template_kwargs must be a mapping")
+    acceptance = c.get("acceptance", {})
+    if acceptance is None:
+        acceptance = {}
+    if not isinstance(acceptance, dict):
+        raise ValueError("acceptance must be a mapping")
+    if acceptance.get("mode", "full") not in {"full", "quality-only"}:
+        raise ValueError("acceptance.mode must be full or quality-only")
+    ttl = acceptance.get("freshness_ttl_seconds", 300)
+    if type(ttl) is not int or not 1 <= ttl <= 3600:
+        raise ValueError("acceptance.freshness_ttl_seconds must be an integer in [1, 3600]")
+    preflight = acceptance.get("preflight", {})
+    if preflight is not None and not isinstance(preflight, dict):
+        raise ValueError("acceptance.preflight must be a mapping")
+    measurements = c.get("measurements", {})
+    if measurements is not None and not isinstance(measurements, dict):
+        raise ValueError("measurements must be a mapping")
+    if isinstance(measurements, dict):
+        deferred = measurements.get("deferred_stages", [])
+        if not isinstance(deferred, list) or any(v not in {"profile", "performance"} for v in deferred):
+            raise ValueError("measurements.deferred_stages must contain only profile/performance")
     # Secrets are injected by name at runtime, never persisted in resolved configuration.
     for key, value in c.get("env", {}).items():
         if re.search(r"TOKEN|SECRET|PASSWORD|API_KEY", key, re.I):

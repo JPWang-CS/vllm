@@ -5,7 +5,9 @@ description: 对已通过正确性检查的模型实验采集整网与设备性�
 
 # 整网性能与算子归因
 
-先读取冻结配置、精度结果、服务参数和基线引用。公开入口为 `fullnet run --model <model> --run <run> [--profile] [--performance] [--pd-probe mixed|split]`；split 的真实 KV 门在 smoke 后、固定评测前，mixed、profile、performance 在评测通过后执行。请求 profile/performance 前，CLI 会校验冻结 config 的 `measurements`、负载/计数和 `deferred_stages`。profile 优先配置 `VLLM_TORCH_PROFILER_DIR`；使用 `--profiler-config` 时按目标 vLLM 的 help 填写 JSON 或参数值。`run_experiment` 在真正 Popen 前，以实际 launch env 验证选定 Python 的 SQLite、官方 Python CLI 命令族和任务输出目录；`prepared_before_launch` 不能代替 `parser_ready`。缺配置必须重新 plan，不能静默改冻结 config。
+先读取冻结配置、精度结果、服务参数和基线引用。新实验由 `fullnet plan` 固定必做阶段，`fullnet run --model <model> --run <run>` 自动执行合同中的测量项；`--profile`、`--performance`、`--pd-probe mixed|split` 保留显式入口。P/D 的真实 KV 检查在 smoke 后、固定评测前完成。profile/performance 使用冻结的 `measurements`、负载和计数；功能优先的计划用 `--quality-only` 明确延后。阶段验收见 [实验阶段与验收](../../../docs/acceptance-contract.md)。
+
+profile 优先配置 `VLLM_TORCH_PROFILER_DIR`；使用 `--profiler-config` 时按目标 vLLM 的 help 填写 JSON 或参数值。`run_experiment` 在真正 Popen 前，以实际 launch env 验证选定 Python 的 SQLite、官方 Python CLI 命令族和任务输出目录。缺配置时补齐后新建 plan，保留原实验记录。
 
 恢复分母使用 `measurements.profile_expected_profs` 和 `profile_expected_devices`，未显式配置时沿用冻结 `devices` 合同；设备 metadata 与运行时编号不同时须在新 plan 中明确预期值。已有导出先执行 verify，不重复 import/export；CSV、完整流式 timeline 与 raw metadata 逐 rank 核对。HTML 共用时间轴须有共同原始时钟证据，先减共同零点再转换浮点；不能把各端归零后同步窗口解释为真实重叠。
 

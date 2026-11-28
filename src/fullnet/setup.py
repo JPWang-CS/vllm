@@ -52,11 +52,33 @@ def configure(root, model, platform, python, weights, dataset, metrics, devices,
                                    "--dtype", "bfloat16", "--tensor-parallel-size", str(len(devices)),
                                    "--max-model-len", str(context_limit), "--max-num-seqs", "4", "--enforce-eager", "--seed", "0"],
                           "base_url": f"http://127.0.0.1:{port}/v1", "served_model": model,
-                          "ready_timeout": 1800, "request_timeout": 180, "shutdown_timeout": 20},
+                          "ready_timeout": 1800, "request_timeout": 180, "shutdown_timeout": 20,
+                          "smoke": {"enabled": True, "prompt": "Reply with OK.", "max_tokens": 8, "timeout": 60}},
               "evaluation": {"dataset": str(Path(dataset).resolve()), "scope": "RULER niah_single_1 + vt, fixed two-task subset",
                              "metric": "ruler_official", "official_metrics": str(Path(metrics).resolve()),
                              "context_limit": context_limit, "seed": 42, "temperature": 0, "top_p": 1,
-                             "chat_template_kwargs": kwargs, "minimum_score": None}}
+                             "chat_template_kwargs": kwargs, "minimum_score": None},
+              # The device runner owns physical/runtime mapping and cleanup
+              # facts.  It must write fresh run-bound evidence; no private host,
+              # tool path or ACL command is guessed here.
+              "acceptance": {"mode": "full", "expected_samples": 48,
+                              "preflight": {
+                                  "assets": {"adapter": "assets-check"},
+                                  "device_gate": {"adapter": "fleet-evidence",
+                                                   "evidence_path": "${RUN}/validation/device-gate.json"},
+                                  "model_import": {"adapter": "model-import", "python": str(python)},
+                                  "cleanup": {"adapter": "fleet-evidence",
+                                               "evidence_path": "${RUN}/validation/cleanup.json"}}},
+              "measurements": {"requests": 32, "warmups": 2, "timeout_per_group": 21600,
+                               "deferred_stages": [],
+                               "profile_workload": {"input": 4096, "output": 128, "concurrency": 1},
+                               "workloads": [
+                                   {"input": 128, "output": 128, "concurrency": 1},
+                                   {"input": 4096, "output": 128, "concurrency": 1},
+                                   {"input": 15999, "output": 128, "concurrency": 1},
+                                   {"input": 128, "output": 1024, "concurrency": 1},
+                                   {"input": 4096, "output": 1024, "concurrency": 4},
+                                   {"input": 128, "output": 4096, "concurrency": 4}]}}
     if manifest.get("family") == "pangu":
         config["service"]["argv"].append("--trust-remote-code")
         config["evaluation"]["add_special_tokens"] = False

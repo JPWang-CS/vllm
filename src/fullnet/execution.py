@@ -15,6 +15,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .acceptance import (AcceptanceBlocked, freeze_contract, initialize,
+                          record as acceptance_record, run_preflight,
+                          summarize, verify_cleanup)
 from .config import SUPPORTED_NPU_PLATFORMS, runtime
 from .evaluation import evaluate, headers, smoke_request, validate_samples
 from .store import RunLock, append_json, experiment, inside, read_json, rows, state, utc, write_json
@@ -22,6 +25,9 @@ from .store import RunLock, append_json, experiment, inside, read_json, rows, st
 
 def profiler_deferred(c):
     """Whether this acceptance stage intentionally defers profiler setup."""
+    contract = c.get("acceptance_contract", {})
+    if contract.get("mode") == "quality-only":
+        return True
     return "profile" in set(c.get("measurements", {}).get("deferred_stages", []))
 
 
@@ -41,22 +47,26 @@ def graceful_termination():
             signal.signal(signal.SIGTERM, previous)
 
 
-def plan(root, c, run_id):
+def plan(root, c, run_id, *, quality_only=None):
     root = Path(root).resolve()
     run = experiment(root, c["model"], run_id)
     c = runtime(c, root, run)
     source = Path(c["evaluation"]["dataset"]).resolve(strict=True)
     samples = rows(source)
     validate_samples(samples, c["evaluation"])
+    contract = freeze_contract(c, len(samples), quality_only=quality_only)
+    contract["run"] = str(run.resolve())
     # Frozen configs/datasets are owned by this experiment. Existing runs never overwritten.
     run.parent.mkdir(parents=True, exist_ok=True)
     run.mkdir()
+    c["acceptance_contract"] = contract
     write_json(run / "config.json", c)
     write_json(run / "changes.json", c["resolved_changes"])
     with (run / "dataset.jsonl").open("x", encoding="utf-8") as output:
         for row in samples:
             output.write(json.dumps(row, ensure_ascii=False) + "\n")
     state(run, "plan", "passed", model=c["model"], platform=c["platform"], samples=len(samples))
+    initialize(run, contract)
     return run
 
 
@@ -199,23 +209,30 @@ def _yield_service_paths(run, c, env):
 
 def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=False,
                    before_evaluation=None):
-    """Run optional pre-evaluation gate after readiness/smoke, with owned cleanup.
+    """Execute one frozen plan and return protocol plus acceptance outcomes.
 
-    ``before_evaluation(run, config)`` must raise on failure. It runs before
-    any frozen evaluation request, including when smoke is disabled.
+    The callback arguments remain source-compatible.  For a new hardware plan
+    the frozen contract supplies missing default measurement callbacks, so a
+    caller cannot accidentally turn off required profile/performance stages by
+    omitting CLI flags.
     """
     run = experiment(root, model, run_id)
     c = read_json(run / "config.json")
+    if not isinstance(c.get("acceptance_contract"), dict):
+        raise ValueError("this legacy experiment is read-only; create a new plan with an acceptance contract")
     current = read_json(run / "state.json")
     if current["phase"] != "plan":
         raise ValueError("this experiment has already started; inspect state and create a new run")
     process = None
+    result = None
+    env = None
     with graceful_termination(), RunLock(run):
         state(run, "execution", "running")
         try:
             check_port(c)
             env = private_environment(run, c, root)
             (run / "logs").mkdir(exist_ok=True)
+            run_preflight(run, c, env, root)
             for change in c["resolved_changes"]:
                 argv = change["spec"]["verify_argv"]
                 append_json(run / "commands.jsonl", {"phase": "change_verify", "argv": argv, "at": utc()})
@@ -275,6 +292,7 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
                         raise TimeoutError("service readiness timed out")
                     time.sleep(.2)
                 state(run, "startup", "passed", pid=process.pid)
+                acceptance_record(run, "startup", "passed", pid=process.pid)
                 if (c["service"].get("smoke") or {}).get("enabled", False):
                     state(run, "smoke", "running", max_tokens=c["service"]["smoke"].get("max_tokens", 8))
                     try:
@@ -283,6 +301,38 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
                         state(run, "smoke", "failed", error=type(exc).__name__, detail=str(exc))
                         raise
                     state(run, "smoke", "passed", record="smoke.json")
+                    acceptance_record(run, "smoke", "passed", record="smoke.json")
+                else:
+                    state(run, "smoke", "not_run", reason="smoke is disabled in the frozen service config")
+                    acceptance_record(run, "smoke", "not_run", reason="smoke is disabled in the frozen service config")
+
+                contract = c["acceptance_contract"]
+                if contract.get("hardware_validation") and not (c["service"].get("smoke") or {}).get("enabled", False):
+                    raise AcceptanceBlocked("hardware plan requires a real generation smoke")
+
+                # Direct Python callers get the same frozen defaults as the CLI.
+                if contract.get("pd_kv_required") and before_evaluation is None:
+                    from .measurements import pd_mixed_probe, pd_split_probe
+                    if contract.get("pd_mode") == "split":
+                        before_evaluation = pd_split_probe
+                    elif contract.get("pd_mode") == "mixed":
+                        before_evaluation = pd_mixed_probe
+                    else:
+                        raise AcceptanceBlocked("frozen P/D contract has no supported pd_mode")
+                if after_evaluation is None and contract.get("mode") != "quality-only":
+                    from .measurements import collect_performance, collect_profile
+                    if contract.get("required_stages", {}).get("profile") or contract.get("required_stages", {}).get("performance"):
+                        def default_after(path, config, evaluation_result):
+                            if contract.get("required_stages", {}).get("profile"):
+                                collect_profile(path, config)
+                            if contract.get("required_stages", {}).get("performance"):
+                                collect_performance(path, config)
+                        after_evaluation = default_after
+
+                if contract.get("pd_kv_required") and contract.get("pd_mode") == "split" and before_evaluation is None:
+                    state(run, "pd_kv", "not_run", reason="frozen P/D KV gate was not invoked")
+                    acceptance_record(run, "pd_kv", "not_run", reason="frozen P/D KV gate was not invoked")
+                    raise AcceptanceBlocked("frozen P/D KV gate is required before evaluation")
                 if before_evaluation is not None:
                     state(run, "before_evaluation", "running")
                     try:
@@ -292,16 +342,36 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
                         state(run, "evaluation", "not_run", reason="before_evaluation gate failed")
                         raise
                     state(run, "before_evaluation", "passed")
+                    if contract.get("pd_kv_required"):
+                        filename = "pd-split-probe.json" if contract.get("pd_mode") == "split" else "pd-mixed-probe.json"
+                        probe = read_json(run / "performance" / filename) if (run / "performance" / filename).is_file() else {}
+                        if probe.get("acceptance") != "passed":
+                            acceptance_record(run, "pd_kv", "failed", evidence="performance/" + filename)
+                            raise AcceptanceBlocked("P/D KV gate has no accepted transfer evidence")
+                        acceptance_record(run, "pd_kv", "passed", evidence="performance/" + filename)
                 state(run, "evaluation", "running")
                 result = evaluate(run, c)
                 state(run, "evaluation", "passed" if result["protocol_pass"] else "failed",
                       quality_status=result["quality_status"], numerical_parity="not_run",
                       **{key: result[key] for key in ("attempted", "succeeded", "failed", "skipped", "timeout", "samples")})
-                passed = result["protocol_pass"] and result["quality_status"] != "failed"
-                state(run, "execution", "passed" if passed else "failed")
-                if passed and after_evaluation is not None:
+                acceptance_record(run, "evaluation", "passed" if result["protocol_pass"] else "failed",
+                                  protocol_pass=result["protocol_pass"], quality_status=result["quality_status"],
+                                  samples=result["samples"], attempted=result["attempted"],
+                                  truncated=sum(v.get("truncated", 0) for v in result.get("groups", [])))
+                acceptance_record(run, "quality", "passed" if result["quality_status"] == "passed" else "not_specified" if result["quality_status"] == "not_specified" else "failed",
+                                  score=result.get("score"), minimum_score=result.get("minimum_score"))
+                protocol_complete = result["protocol_pass"]
+                quality_passed = result["quality_status"] == "passed"
+                state(run, "execution", "completed" if protocol_complete else "failed",
+                      protocol_pass=protocol_complete, quality_status=result["quality_status"])
+                if protocol_complete and quality_passed and after_evaluation is not None:
                     after_evaluation(run, c, result)
-                if passed and keep_ready:
+                elif protocol_complete and not quality_passed:
+                    for stage in ("profile", "performance"):
+                        if contract.get("required_stages", {}).get(stage):
+                            acceptance_record(run, stage, "blocked", reason="quality gate is not passed")
+                            state(run, stage, "blocked", reason="quality gate is not passed")
+                if protocol_complete and keep_ready:
                     state(run, 'serving', 'ready', pid=process.pid, base_url=c['service']['base_url'])
                     print(json.dumps({'serving': 'ready', 'run': str(run), 'pid': process.pid,
                                       'base_url': c['service']['base_url']}), flush=True)
@@ -314,6 +384,23 @@ def run_experiment(root, model, run_id, *, after_evaluation=None, keep_ready=Fal
             state(run, "execution", "failed", error=type(exc).__name__, detail=str(exc))
             raise
         finally:
-            stop_owned(process, c["service"].get("shutdown_timeout", 10))
-            state(run, "cleanup", "process_group_signalled", service_exit=None if process is None else process.poll(),
-                  device_release="requires_external_verification")
+            cleanup_started_at = utc()
+            state(run, "cleanup", "running", cleanup_started_at=cleanup_started_at)
+            try:
+                stop_owned(process, c["service"].get("shutdown_timeout", 10))
+                signalled = True
+            except BaseException as exc:
+                signalled = False
+                state(run, "cleanup", "failed", signal_error=type(exc).__name__, detail=str(exc))
+            cleanup_stopped_at = utc()
+            state(run, "cleanup", "process_group_signalled" if signalled else "failed",
+                  service_exit=None if process is None else process.poll(),
+                  cleanup_started_at=cleanup_started_at, cleanup_stopped_at=cleanup_stopped_at)
+            verification = verify_cleanup(run, c, env or os.environ.copy(), root, keep_ready=keep_ready)
+            state(run, "cleanup", "process_group_signalled" if signalled else "failed",
+                  service_exit=None if process is None else process.poll(),
+                  cleanup_started_at=cleanup_started_at, cleanup_stopped_at=cleanup_stopped_at,
+                  device_release=verification, resource_verification=verification)
+            summary = summarize(run, c, result)
+            if result is not None:
+                result.update(summary)

@@ -18,6 +18,8 @@
 
 `models/<model>/experiments/<id>/config.json` 和 `dataset.jsonl` 在启动前冻结。变更后的输入、模板、生成参数或配置创建新实验。检查旧进程和状态后恢复，不能覆盖旧结果。服务请求通过、任务精度、数值一致性、性能分别记录。
 
+新计划同时保存阶段合同和 `acceptance.json`。必做阶段由计划决定，CLI 与 Python 入口使用同一合同；`status`、`report` 分别呈现协议完成、质量、性能、profile 和资源释放。未设质量阈值仍执行评测并记录 `not_specified`，完整验收保持 `INCOMPLETE`。先验证功能使用 plan 的 `--quality-only`。旧实验保持原记录，新合同用于新计划，操作见 [实验阶段与验收](docs/acceptance-contract.md)。
+
 不自动 commit/push，不记录认证信息，不做例行文件哈希。实现后运行项目内测试及离线流程，再进行真实设备验收。
 
 新任务启动前同步已发布 main 的框架源码，并核对实际加载路径。远端源码副本使用项目内的已发布快照与 `.runtime/framework-source.json`，按实际内容核对；不得仅凭分支名称或文件存在判断更新完成。旧 broker 的内存源码与磁盘不一致时拒绝新 run；已有运行任务不热更新、不重启。源码差异先保存在本任务内，不修改权重、环境、私有配置或实验记录。

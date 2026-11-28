@@ -59,15 +59,18 @@ AI 会根据实际模型和运行时准备配置。仓库提供 Ascend A2/A3/A5 
 
 AI 先读取项目规则、模型说明和对应 Skill，再核对原始配置、运行时加载路径、权重、设备健康与空闲状态。随后固定输入和生成协议，独立完成真实短生成、固定评测、服务性能和设备 profile；每个阶段保留原始日志、退出码和失败原因。修改或算子替换必须创建独立实验，并与原生基线使用相同条件对照。
 
-公开 CLI 的阶段入口是：
+新实验在计划中固定执行阶段，运行时按计划依次完成：
 
 ```bash
-fullnet run --model <model> --run <run> [--profile] [--performance]
-fullnet run --model <model> --run <run> --pd-probe mixed
-fullnet run --model <model> --run <run> --pd-probe split
+fullnet plan --config <config> --run <run>
+fullnet run --model <model> --run <run>
+fullnet status --model <model> --run <run>
+fullnet verify --model <model> --run <run>
 ```
 
-`--pd-probe split` 在固定评测前检查 KV 交接；`--pd-probe mixed`、`--profile` 和 `--performance` 在固定评测通过后执行。前两个 flag 要求冻结配置中已经有合法的 `measurements`；`--profile` 还要求服务端 profiler 已在配置中启用。修改这些字段后必须重新执行 `fullnet plan`，不能对已经开始的实验临时补配置。`mixed` 只适用于同一服务实例确实能提供混合 P/D 证据；`split` 需要实际的 producer/consumer、KV-transfer 和 `/metrics_snapshot` 适配器，普通单服务配置不能直接使用。
+计划包含预检、真实短生成、固定评测、性能、profile 和清理。P/D 配置还包含评测前的 KV 交接检查。`--profile`、`--performance` 与 `--pd-probe` 保留为显式入口，必做阶段由冻结计划决定。预检及测量配置缺失时先补齐配置，再创建计划。
+
+先验证功能时使用 `fullnet plan --config <config> --run <run> --quality-only`，将性能与 profile 明确记为延后。阶段顺序、结果含义和恢复条件见[实验阶段与验收](docs/acceptance-contract.md)。
 
 真实设备运行时，配置中的 `devices` 是进程使用的 runtime/logical device selector，不等同于 `npu-smi` 的物理 board ID。A2/A3/A5 运行前都要取得当前 host 上的物理到 runtime/ACL 映射，再重新确认目标设备健康、空闲且没有本任务外的进程；这次 fresh gate 通过后才可启动模型。换卡或换平台必须建立新的实验。
 
@@ -120,7 +123,7 @@ fullnet report --model workflow-fixture --run workflow-001
 
 每次任务的配置、输入、日志、输出和报告都保存在项目目录。结果查看与后续分析可以继续交给 AI；后台任务提交与恢复见 [长任务与 AI 执行](docs/background-jobs.md)。
 
-`fullnet run` 的退出码 0 表示框架任务和评测协议完成，并不自动表示质量通过。评分阈值为 `null` 时，结果会保留 `quality_status=not_specified`；外部 CI 或交付脚本必须同时检查结果中的 `protocol_pass`、`quality_status`、profile、performance 和 cleanup 状态。只有明确的质量阈值满足后，才能把质量记为 `passed`。
+`fullnet run` 的退出码 0 表示框架任务和评测协议完成。评分阈值为 `null` 时保留 `quality_status=not_specified`。外部 CI 使用 `fullnet verify` 检查完整验收，只有必做阶段齐全且满足质量等要求时才返回 0。
 
 ## 使用文档
 
@@ -134,6 +137,7 @@ fullnet report --model workflow-fixture --run workflow-001
 | 查看模型配置与适配入口 | [模型目录](models/) |
 | 模型、配置和实验目录规范 | [模型与实验目录规范](docs/repository-layout.md) |
 | 部署矩阵与完整验收条件 | [部署验证](docs/deployment-validation.md) |
+| 固定必做阶段、质量与完整验收 | [实验阶段与验收](docs/acceptance-contract.md) |
 | 按阶段定位失败 | [调试方法](docs/debugging.md) |
 
 ## License

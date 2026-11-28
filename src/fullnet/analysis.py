@@ -159,17 +159,43 @@ def report(run):
     run = Path(run)
     c, state = read_json(run / "config.json"), read_json(run / "state.json")
     result = read_json(run / "results.json") if (run / "results.json").exists() else {}
+    acceptance = read_json(run / "acceptance.json") if (run / "acceptance.json").exists() else {}
     lines = [f"# {c['model']} / {run.name}", "", f"平台：{c['platform']}。设备：{c.get('devices', [])}。",
              "", "| 检查 | 结果 |", "|---|---|"]
     for phase, value in state["phases"].items():
         lines.append(f"| {phase} | {value['status']} |")
     lines.extend([f"| 任务精度 | {result.get('quality_status', 'not_run')} |",
-                  f"| 数值一致性 | {result.get('numerical_parity', 'not_run')} |", ""])
+                  f"| 数值一致性 | {result.get('numerical_parity', 'not_run')} |",
+                  f"| execution_completed | {acceptance.get('execution_completed', 'legacy_read_only')} |",
+                  f"| business_acceptance | {acceptance.get('business_acceptance', 'LEGACY_READ_ONLY')} |",
+                  ""])
+    if acceptance.get("reasons"):
+        lines += ["验收阻断：" + "；".join(str(v) for v in acceptance["reasons"]), ""]
     if result:
-        lines += [f"评测范围：{result['scope']}。按固定样本数加权得分：{result['score']:.3f}。", "",
+        score = result.get("score")
+        score_text = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
+        lines += [f"评测范围：{result['scope']}。按固定样本数加权得分：{score_text}。", "",
                   "| 任务 | 上下文长度 | 样本数 | 得分 | 请求失败 | 截断 |", "|---|---:|---:|---:|---:|---:|"]
         lines += [f"| {v['task']} | {v['context_limit']} | {v['samples']} | {v['score']:.3f} | {v['protocol_failures']} | {v['truncated']} |"
                   for v in result['groups']]
     lines += ["", "配置、原始请求与响应保存在本实验目录。性能需使用固定负载另行采集。", ""]
     (run / "report.md").write_text("\n".join(lines), encoding="utf-8")
     return run / "report.md"
+
+
+def status(run):
+    """Read-only status view; legacy runs are never upgraded or rewritten."""
+    run = Path(run)
+    value = read_json(run / "state.json")
+    acceptance_path = run / "acceptance.json"
+    if acceptance_path.is_file():
+        acceptance = read_json(acceptance_path)
+        value = {**value, "execution_completed": acceptance.get("execution_completed"),
+                 "business_acceptance": acceptance.get("business_acceptance"),
+                 "acceptance_reasons": acceptance.get("reasons", []),
+                 "acceptance_contract_version": acceptance.get("contract", {}).get("version")}
+    else:
+        value = {**value, "execution_completed": None,
+                 "business_acceptance": "LEGACY_READ_ONLY",
+                 "acceptance_reasons": ["legacy experiment has no frozen acceptance contract"]}
+    return value

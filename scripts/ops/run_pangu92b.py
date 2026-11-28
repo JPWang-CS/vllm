@@ -1,11 +1,18 @@
 """Real 92B native deployment with quality-first acceptance."""
 import argparse,copy,json,os,re,shutil,subprocess,sys
 from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from fullnet.analysis import report
 from fullnet.execution import plan,run_experiment
 from fullnet.export import export_run
 from fullnet.measurements import collect_performance,collect_profile,pd_mixed_probe,pd_split_probe
 from fullnet.store import read_json,rows,write_json
+from scripts.ops.runner_acceptance import (load_acceptance_config, plan_with_acceptance,
+                                            update_result_status)
 
 
 def apply_reference_env_overrides(env, overrides):
@@ -41,6 +48,8 @@ def main():
     p.add_argument('--task',required=True);p.add_argument('--port',type=int,default=18322)
     p.add_argument('--dataset',type=Path);p.add_argument('--keep-ready',action='store_true')
     p.add_argument('--quality-only',action='store_true');p.add_argument('--requests',type=int,default=32)
+    p.add_argument('--acceptance-config',type=Path,
+                    help='Current task-local full config containing acceptance and preflight')
     p.add_argument('--max-batched-tokens',type=int,default=4096)
     p.add_argument('--max-seqs',type=int,default=8)
     p.add_argument('--env-override-file',type=Path)
@@ -52,6 +61,24 @@ def main():
     workers_needed=a.tp*a.dp*a.pp*(2 if split else 1)
     if not task.is_relative_to(root) or len(a.devices)!=workers_needed or len(a.npu_ids)!=len(a.devices):raise ValueError('project or worker count mismatch')
     if a.max_batched_tokens<1 or a.max_seqs<1:raise ValueError('max batched tokens and max seqs must be positive')
+    def acceptance_failure(exc):
+        status={'model':'pangu-92b','model_requests':'not_run','profile':'not_run','performance':'not_run',
+                'quality_only':a.quality_only,'stage':'acceptance-preflight','error':type(exc).__name__,
+                'detail':str(exc),'exit_code':1,'business_acceptance':'INCOMPLETE'}
+        write_json(task/'validation.json',status)
+        (task/'task-report.md').write_text(
+            '# Pangu 92B task report\n\n'
+            f"- Exit code: 1\n- Stage: acceptance-preflight\n"
+            f"- Failure: {type(exc).__name__}: {exc}\n", encoding='utf-8')
+        export=task/'export';export.mkdir(parents=True,exist_ok=True)
+        write_json(export/'validation.json',status)
+        (export/'task-report.md').write_text((task/'task-report.md').read_text(encoding='utf-8'),encoding='utf-8')
+        print(f'FAILED: {type(exc).__name__}: {exc}',file=sys.stderr)
+        return 1
+    try:
+        acceptance,_=load_acceptance_config(a.acceptance_config,task,expected_samples=48,quality_only=a.quality_only)
+    except Exception as exc:
+        return acceptance_failure(exc)
     ref=read_json(a.reference);b=ref['bootstrap'];python=b['python'];weights=a.weights.resolve(strict=True)
     hf=read_json(weights/'config.json')
     if hf.get('architectures')!=['PanguUltraMoEForCausalLM'] or hf.get('num_hidden_layers')!=46 or hf.get('hidden_size')!=2560:
@@ -159,20 +186,21 @@ def main():
            'evaluation':{'dataset':str(dataset),'scope':'RULER two-task subset, 48 samples','metric':'ruler_official',
               'official_metrics':str(ruler/'scripts/eval/synthetic/constants.py'),'context_limit':32768-a.mtp*3,
               'seed':42,'temperature':0,'top_p':1,'chat_template_kwargs':{'thinking':False},'add_special_tokens':False,'minimum_score':None},
-           'measurements':{'requests':a.requests,'warmups':2,
+           'acceptance':acceptance,
+           'measurements':{'requests':a.requests,'warmups':2,'pd_mode':a.pd_mode or 'off',
               'deferred_stages':['profile','performance'] if a.quality_only else [],
               # Orchestration ceiling only: single-engine decode (~5 tok/s observed) makes the
               # 1024/4096-output groups run 2-4h and leaves headroom if c4 aggregate decode
               # lands low; the previous 3600s default killed case-03 mid-run in 06-01.
               # Request counts, lengths and concurrency budgets stay frozen.
-              'timeout_per_group':21600,'workloads':[
+               'timeout_per_group':21600,'profile_workload':{'input':4096,'output':128,'concurrency':1},'workloads':[
               {'input':128,'output':128,'concurrency':1},{'input':4096,'output':128,'concurrency':1},
               {'input':15999,'output':128,'concurrency':1},{'input':128,'output':1024,'concurrency':1},
               {'input':4096,'output':1024,'concurrency':4},{'input':128,'output':4096,'concurrency':4}]}}
         status['stage']='device-before-launch'
         guard('device-before-launch')
         assert_aligned_decode_plan(env,c['env'],aligned_decode_env)
-        os.environ.update(env);run=plan(root,c,a.task);owns_run=True
+        os.environ.update(env);run=plan_with_acceptance(plan,root,c,a.task,acceptance,quality_only=a.quality_only);owns_run=True
         frozen=read_json(run/'config.json')
         assert_aligned_decode_plan(env,frozen['env'],aligned_decode_env)
         if frozen['identity'].get('aligned_decode_env')!=aligned_decode_env:
@@ -209,6 +237,11 @@ def main():
             status['stage']='evaluated'
             report(path);write_json(task/'validation.json',status)
         result=run_experiment(root,'pangu-92b',a.task,after_evaluation=finished,keep_ready=a.keep_ready)
+        update_result_status(status,result,quality_only=a.quality_only)
+        if a.quality_only:
+            status['profile']='deferred_by_user';status['performance_phase']='deferred_by_user'
+        elif result.get('quality_status')!='passed':
+            status['profile']='blocked_by_quality_gate';status['performance_phase']='blocked_by_quality_gate'
         if not result['protocol_pass']:raise RuntimeError('quality request protocol failed')
     except Exception as exc:
         exit_code=1;failure=exc;status.update(error=type(exc).__name__,detail=str(exc),exit_code=1)

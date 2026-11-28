@@ -4,7 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from .analysis import comparison, numeric_parity, report
+from .analysis import comparison, numeric_parity, report, status as run_status
+from .acceptance import verify_run
 from .assets import assets, doctor
 from .setup import configure
 from .export import export_run
@@ -135,27 +136,45 @@ def _validate_measurement_contract(config, args):
 
 
 def _measurement_callbacks(args, root):
-    requested = args.profile or args.performance or args.pd_probe is not None
+    config_path = experiment(root, args.model, args.run) / "config.json"
+    if not config_path.is_file():
+        raise ValueError("experiment config is missing; create a new plan before running")
+    config = read_json(config_path)
+    contract = config.get("acceptance_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("legacy experiment is read-only; create a new plan before running")
+    required = contract.get("required_stages", {})
+    effective_profile = bool(args.profile or required.get("profile"))
+    effective_performance = bool(args.performance or required.get("performance"))
+    pd_mode = args.pd_probe or contract.get("pd_mode")
+    requested = effective_profile or effective_performance or pd_mode is not None
     if not requested:
         return {}
-    config = read_json(experiment(root, args.model, args.run) / "config.json")
-    _validate_measurement_contract(config, args)
+    # Validate explicit flags and the frozen workloads. Required stages are
+    # selected from the plan itself, not from what the caller remembered to pass.
+    _MeasurementArgs = type("_MeasurementArgs", (), {
+        "profile": effective_profile, "performance": effective_performance,
+    })
+    _validate_measurement_contract(config, _MeasurementArgs)
 
     def before_evaluation(run, config):
-        pd_split_probe(run, config)
+        if pd_mode == "split":
+            pd_split_probe(run, config)
+        elif pd_mode == "mixed":
+            pd_mixed_probe(run, config)
+        else:
+            raise ValueError("frozen P/D contract has no supported pd_mode")
 
     def after_evaluation(run, config, result):
-        if args.pd_probe == "mixed":
-            pd_mixed_probe(run, config)
-        if args.profile:
+        if effective_profile:
             collect_profile(run, config)
-        if args.performance:
+        if effective_performance:
             collect_performance(run, config)
 
     callbacks = {}
-    if args.pd_probe == "split":
+    if pd_mode in {"split", "mixed"}:
         callbacks["before_evaluation"] = before_evaluation
-    if args.profile or args.performance or args.pd_probe == "mixed":
+    if effective_profile or effective_performance:
         callbacks["after_evaluation"] = after_evaluation
     return callbacks
 
@@ -186,7 +205,9 @@ def main(argv=None):
         cmd.add_argument("--config", type=Path, required=True)
         if command == "plan":
             cmd.add_argument("--run", required=True)
-    for command in ("run", "status", "report"):
+            cmd.add_argument("--quality-only", action="store_true",
+                             help="Freeze profile/performance as deferred_by_user in this new plan")
+    for command in ("run", "status", "report", "verify"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--model", required=True)
         cmd.add_argument("--run", required=True)
@@ -221,7 +242,7 @@ def main(argv=None):
             c = resolve(args.config, root)
             result = {"model": c["model"], "platform": c["platform"], "config_valid": True}
             if args.command == "plan":
-                result["experiment"] = str(plan(root, c, args.run))
+                result["experiment"] = str(plan(root, c, args.run, quality_only=True if args.quality_only else None))
         elif args.command == "run":
             callbacks = _measurement_callbacks(args, root)
             result = run_experiment(root, args.model, args.run, keep_ready=args.keep_ready,
@@ -229,9 +250,14 @@ def main(argv=None):
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["protocol_pass"] and result["quality_status"] != "failed" else 1
         elif args.command == "status":
-            result = read_json(experiment(root, args.model, args.run) / "state.json")
+            result = run_status(experiment(root, args.model, args.run))
         elif args.command == "report":
             result = {"report": str(report(experiment(root, args.model, args.run)))}
+        elif args.command == "verify":
+            result = verify_run(experiment(root, args.model, args.run),
+                                read_json(experiment(root, args.model, args.run) / "config.json"))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result.get("business_acceptance") == "ACCEPTED" else 1
         elif args.command == "compare":
             candidate = experiment(root, args.model, args.candidate)
             result = comparison(experiment(root, args.model, args.baseline), candidate)

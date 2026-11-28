@@ -6,11 +6,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from fullnet.analysis import report
 from fullnet.execution import plan, run_experiment
 from fullnet.export import export_run
 from fullnet.store import experiment, read_json, rows
 from fullnet.pangu7b_device_guard import configure_pangu7b_platform_env, verify_npu_smi_output
+from scripts.ops.runner_acceptance import load_acceptance_config, plan_with_acceptance, update_result_status
 
 
 def main():
@@ -28,6 +33,8 @@ def main():
     p.add_argument('--port', type=int, default=None)
     p.add_argument("--prepare-only", action="store_true", help="Prepare fixed evaluation samples without device computation")
     p.add_argument("--entrypoint-only", action="store_true", help="Check the real model entrypoint without loading weights")
+    p.add_argument("--acceptance-config", type=Path,
+                   help="Current task-local full config containing acceptance and preflight")
     a = p.parse_args()
     if a.port is None:
         a.port = 18320 if a.platform == "a2" else 18321
@@ -35,6 +42,10 @@ def main():
     task = (root / "runs" / a.task).resolve(strict=True)
     if not task.is_relative_to(root):
         raise ValueError("task outside project")
+    acceptance = None
+    if not a.prepare_only and not a.entrypoint_only:
+        acceptance, _ = load_acceptance_config(a.acceptance_config, task,
+                                               expected_samples=48, quality_only=True)
     env = os.environ.copy()
     runtime = a.runtime_root.resolve(strict=True)
     sources = [runtime / "source/image/opt/vllm", runtime / "source/image/workspace/omniinfer/components/omni-npu/src",
@@ -134,7 +145,7 @@ def main():
                        "chat_template_kwargs":{},"add_special_tokens":False,"minimum_score":None}}
         guard("device-before-launch")
         os.environ.update(env)
-        run=plan(root,c,a.task)
+        run=plan_with_acceptance(plan, root, c, a.task, acceptance, quality_only=True)
         def completed(path,config,result):
             status.update(model_inference='requests_completed',quality_on_real_model=result['quality_status'],
                           score=result['score'],protocol_pass=result['protocol_pass'],retention_requested=a.keep_ready)
@@ -142,6 +153,7 @@ def main():
             export_run(root,path,task/'export')
             (task/'validation.json').write_text(json.dumps(status,ensure_ascii=False,indent=2))
         result=run_experiment(root,"pangu-7b",a.task,after_evaluation=completed,keep_ready=a.keep_ready)
+        update_result_status(status, result, quality_only=True)
         report(run)
         status.update(model_inference="requests_completed",quality_on_real_model=result["quality_status"],score=result["score"],protocol_pass=result["protocol_pass"])
         if not result["protocol_pass"] or result["quality_status"] == "failed":

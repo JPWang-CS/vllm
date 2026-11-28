@@ -42,6 +42,43 @@ def check_safetensors(path):
     return len(spans)
 
 
+def check_local_assets(path):
+    """Read-only validation of an already selected model directory.
+
+    This is intentionally independent of the download manifest and never
+    creates a cache, writes a receipt beside the weights, or fetches anything.
+    """
+    target = Path(path).resolve(strict=True)
+    if not target.is_dir():
+        raise ValueError("frozen identity.weights must resolve to a directory")
+    config = target / "config.json"
+    if not config.is_file():
+        raise ValueError("model assets are missing config.json")
+    from .store import read_json
+    metadata = read_json(config)
+    files = sorted(target.glob("*.safetensors")) + sorted(target.glob("*.bin"))
+    if not files:
+        raise ValueError("model assets contain no supported weight files")
+    for item in files:
+        if item.suffix == ".safetensors":
+            check_safetensors(item)
+        elif item.stat().st_size == 0:
+            raise ValueError(f"empty weight file: {item.name}")
+    for index in target.glob("*.index.json"):
+        shards = set(read_json(index).get("weight_map", {}).values())
+        if not shards or any(not inside(target, target / shard).is_file() for shard in shards):
+            raise ValueError(f"missing weight shard referenced by {index.name}")
+    tokenizer = next((target / name for name in ("tokenizer.json", "tokenizer.model", "vocab.json")
+                      if (target / name).is_file()), None)
+    if tokenizer is None:
+        raise ValueError("model assets are missing tokenizer files")
+    return {"status": "files_present", "target": str(target),
+            "config_architectures": metadata.get("architectures", []),
+            "weight_files": len(files),
+            "weight_bytes": sum(item.stat().st_size for item in files),
+            "tokenizer": str(tokenizer), "device_execution": "not_run"}
+
+
 def model_assets(root, model):
     manifest = load(inside(root, Path(root) / "models" / name(model) / "model.yaml"))
     source = manifest.get("download", {})

@@ -13,8 +13,19 @@ identity:
   vllm_version: ${VLLM_VERSION}
   platform_plugin_version: ${PLATFORM_PLUGIN_VERSION}
   cann_version: ${CANN_VERSION}
-env: {}
+env:
+  VLLM_TORCH_PROFILER_DIR: ${RUN}/profiles
 changes: []
+acceptance:
+  mode: full
+  expected_samples: 48
+  preflight:
+    assets: {adapter: assets-check}
+    # The registered fleet runner must write these run-bound receipts before
+    # fullnet run. It owns the host-matched npu-smi and ACL mapping.
+    device_gate: {adapter: fleet-evidence, evidence_path: ${RUN}/validation/device-gate.json}
+    model_import: {adapter: model-import, python: ${MODEL_PYTHON}}
+    cleanup: {adapter: fleet-evidence, evidence_path: ${RUN}/validation/cleanup.json}
 service:
   argv: ["${MODEL_PYTHON}", "-m", "vllm.entrypoints.openai.api_server", "--model", "${MODEL_PATH}", "--served-model-name", "pangu", "--trust-remote-code", "--host", "127.0.0.1", "--port", "18320", "--dtype", "bfloat16", "--tensor-parallel-size", "1", "--max-model-len", "16384", "--max-num-seqs", "4", "--enforce-eager", "--seed", "0"]
   base_url: http://127.0.0.1:18320/v1
@@ -22,6 +33,7 @@ service:
   ready_timeout: 1800
   request_timeout: 180
   shutdown_timeout: 20
+  smoke: {enabled: true, prompt: "Reply with OK.", max_tokens: 8, timeout: 60}
 evaluation:
   dataset: ${EVAL_DATASET}
   scope: RULER niah_single_1 + vt, fixed two-task subset
@@ -34,3 +46,16 @@ evaluation:
   chat_template_kwargs: {thinking: false}
   add_special_tokens: false
   minimum_score: null
+measurements:
+  requests: 32
+  warmups: 2
+  timeout_per_group: 21600
+  deferred_stages: []
+  profile_workload: {input: 4096, output: 128, concurrency: 1}
+  workloads:
+    - {input: 128, output: 128, concurrency: 1}
+    - {input: 4096, output: 128, concurrency: 1}
+    - {input: 15999, output: 128, concurrency: 1}
+    - {input: 128, output: 1024, concurrency: 1}
+    - {input: 4096, output: 1024, concurrency: 4}
+    - {input: 128, output: 4096, concurrency: 4}

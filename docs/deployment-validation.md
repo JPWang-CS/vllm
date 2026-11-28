@@ -17,17 +17,32 @@ A5 单机 case 使用受控 native runner。提交前只读核对权重、48 条
 
 A2、A3、A5 的基础功能都使用独立 case：真实服务启动、短请求、冻结评测和 cleanup 必须分别成立。A2 不因 CLI 支持 `platform=a2` 就继承 A3/A5 的设备、映射、分数或性能结果；每个平台都要在自己的 runtime、权重、CANN 和 fresh gate 上重新验证。
 
-## 公开 CLI 的测量与 P/D 入口
-
-公开入口可选择以下阶段；split 的 KV 检查在固定评测前执行，mixed、profile 和 performance 在固定评测后执行：
+盘古原生运行脚本统一使用 `--acceptance-config` 读取当前任务内的 YAML 或 JSON 配置。配置中的 `acceptance` 提供阶段和预检设置，实际路径按目标环境填写；运行脚本保留模型自己的固定样本、模板和负载。以 7B 功能验证为例：
 
 ```bash
-fullnet run --model <model> --run <run> --profile --performance
-fullnet run --model <model> --run <run> --pd-probe mixed
-fullnet run --model <model> --run <run> --pd-probe split
+python -B scripts/ops/run_pangu7b_matrix.py \
+  --project "$PWD" --task <task> \
+  --runtime-root <runtime> --model-python <model-python> \
+  --weights <weights> --platform a5 \
+  --device-index <runtime-id> --npu-id <board-id> \
+  --dataset <fixed-48-samples> \
+  --acceptance-config "$PWD/runs/<task>/config.yaml" \
+  --quality-only
 ```
 
-使用 `--profile` 或 `--performance` 前，冻结配置必须包含合法的 `measurements` mapping。盘古代表 contract 至少应包含：
+`validate_pangu7b.py` 和 `run_pangu92b.py` 使用同一个合同读取器。缺少设置时在准备与模型执行前报出具体缺项；CPU-only 的准备入口保留原职责。
+
+## 公开 CLI 的测量与 P/D 入口
+
+新实验先固定验收合同，再执行必做阶段。split 和 mixed 的真实 KV 检查均在固定评测前完成；性能和 profile 在评测满足前置条件后执行：
+
+```bash
+fullnet plan --config <config> --run <run>
+fullnet run --model <model> --run <run>
+fullnet status --model <model> --run <run>
+```
+
+`--profile`、`--performance` 和 `--pd-probe` 保留显式入口；完整计划会自动选择必做阶段。功能优先时在 plan 增加 `--quality-only`，将性能和 profile 明确延后。阶段结果见[实验阶段与验收](acceptance-contract.md)。完整计划的冻结配置必须包含合法的 `measurements` mapping。盘古代表合同的服务性能负载包括：
 
 ```yaml
 measurements:
@@ -51,6 +66,42 @@ measurements:
 `--pd-probe mixed` 只适用于同一个服务实例具备混合 P/D 证据的部署。`--pd-probe split` 只适用于已经启动 producer/consumer、KV-transfer connector、split front，并提供 `/metrics_snapshot` 和两侧 connector 日志的部署；普通单服务 argv 不是 split case。P/D 角色、拓扑、设备分组或服务入口变化时，另建 case 和 run。
 
 ## 多卡、多机和 P/D
+
+跨机 case 使用 `scripts/ops/cross_host_case.py`。私有 manifest 固定模型、角色、主机、预期 rank/world、候选设备及 CPU 准备作业身份。候选进入设备阶段前，需要读取对应的 CPU prepare 回执、源码清单、运行环境与网络探测结果。
+
+manifest 的 `scenario` 区分跨机 TP 和跨机 P/D。跨机 TP2 的两个 Worker 属于同一个 `world_size=2`，分别为 rank 0、rank 1。P/D 两端各用 TP1 时，每端都是自己的 `world_size=1、rank=0`。P/D 按角色管理资源，通过真实 KV 交接检查两端协作。
+
+```bash
+python -B scripts/ops/cross_host_case.py \
+  --project "$PWD" --task <task> \
+  --manifest "$PWD/runs/<task>/repair/CROSS_HOST_CASE.json" \
+  --action validate
+```
+
+同一入口按阶段使用以下 action：
+
+| Action | 用途 |
+|---|---|
+| `inventory` | 经现有 broker 查询 manifest 中的候选主机 |
+| `select` | 读取任务内两次完整 inventory 和 CPU 准备证据，固定候选交集 |
+| `submit` | 按角色提交；已有相同 request/job 时接回原任务 |
+| `status` | 查询当前角色作业并保存完整回执 |
+| `rank-evidence` | 汇聚各角色的真实 Ray actor 日志证据 |
+| `requeue` | 核对资源失败、模型未开始和精确清理证据后回队列 |
+
+`select` 默认读取任务 `repair/` 中的 `CROSS_HOST_FIRST_SCAN.json`、`CROSS_HOST_SECOND_SCAN.json`；`requeue` 默认读取 `CROSS_HOST_REQUEUE_EVIDENCE.json`。提交前生成当前角色的 `role-spec.json`，包含 case、model、role、host、request、job、`expected_ranks` 和 `expected_world`，随角色输入一起保存。控制端持续复用同一组请求与作业身份。
+
+每个角色在实际所在主机的个人容器内调用单端收集入口：
+
+```bash
+python -B scripts/ops/cross_host_role.py \
+  --project <project> --job-root <current-job-root> \
+  --role <role> --host <registered-host> \
+  --task-id <ray-task-id> --case-id <case> --model <model> \
+  --request-id <request> --job <job> --stage <stage>
+```
+
+它从当前角色的 Ray session 读取 global rank/world 与模型加载完成记录，合并写入当前 job 的 `validation.json`，保留已有阶段。控制端通过完整 fleet 回执汇聚两端结果。日志中的开始加载、加载完成和实际 rank 分别解析，原始文件路径一并保留。
 
 A5 单机 TP2、TP4、TP2DP2、TP1DP4 展开 Eager/Graph 与 MTP0/3；每个 case 使用独立实验。A3、multi-host TP/DP、same-host split PD、跨机 PD 和 mixed deployment 分开建 case。`fleet-inventory` 只收集登记主机的只读事实，不能解锁没有真实 adapter、权重/runtime、host role、设备映射和可执行配置的 case。
 

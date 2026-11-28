@@ -265,6 +265,22 @@ def test_pangu_runner_exports_failure_report_before_run_exists(tmp_path, monkeyp
     root = tmp_path / "project"
     task = root / "runs" / "failed-before-plan"
     task.mkdir(parents=True)
+    acceptance = task / "acceptance-config.json"
+    acceptance.write_text(json.dumps({
+        "schema_version": 1, "model": "pangu-92b", "platform": "a5", "devices": [0],
+        "identity": {"architecture": "PanguUltraMoEForCausalLM"},
+        "service": {"smoke": {"enabled": True}},
+        "evaluation": {"metric": "ruler_official", "context_limit": 32768,
+                        "minimum_score": None},
+        "acceptance": {"mode": "full", "expected_samples": 48, "preflight": {
+            "assets": {"adapter": "assets-check"},
+            "device_gate": {"adapter": "fleet-evidence", "evidence_path": "${RUN}/device.json"},
+            "model_import": {"adapter": "model-import", "python": sys.executable},
+            "cleanup": {"adapter": "fleet-evidence", "evidence_path": "${RUN}/cleanup.json"},
+        }},
+        "measurements": {"requests": 32, "profile_workload": {"input": 4096, "output": 128, "concurrency": 1},
+                          "workloads": [{"input": 128, "output": 128, "concurrency": 1}]},
+    }), encoding="utf-8")
     reference = tmp_path / "reference.json"
     extra = tmp_path / "model-extra.json"
     extra.write_text("{}")
@@ -279,7 +295,8 @@ def test_pangu_runner_exports_failure_report_before_run_exists(tmp_path, monkeyp
     (weights / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w": "shard.safetensors"}}))
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="device query failed", stderr=""))
     monkeypatch.setattr(sys, "argv", [str(script), "--project", str(root), "--reference", str(reference),
-        "--weights", str(weights), "--devices", "0", "--npu-ids", "1", "--tp", "1", "--task", task.name])
+        "--weights", str(weights), "--devices", "0", "--npu-ids", "1", "--tp", "1", "--task", task.name,
+        "--acceptance-config", str(acceptance)])
     assert module.main() == 1
     validation = read_json(task / "validation.json")
     assert validation["exit_code"] == 1 and validation["model_requests"] == "not_run"
