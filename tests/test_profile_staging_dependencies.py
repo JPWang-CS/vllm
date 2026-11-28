@@ -44,3 +44,16 @@ def test_existing_wrong_dependency_is_rejected_not_overwritten(tmp_path):
 def test_no_manifest_keeps_default_empty_contract(tmp_path):
  source,job=task(tmp_path,{})
  assert stage(source,job)==[]
+
+def test_frozen_jsonl_dataset_reaches_job_unchanged(tmp_path):
+ dataset=''.join(json.dumps({'id':i,'prompt':'fixed sample'})+'\n' for i in range(48))
+ source,job=task(tmp_path,{'repair/probe.dependencies.json':json.dumps({'files':['repair/data/all.jsonl']}),'repair/data/all.jsonl':dataset})
+ receipt=stage(source,job)
+ assert {x['path'] for x in receipt}=={'repair/probe.dependencies.json','repair/data/all.jsonl'}
+ assert (job/'repair/data/all.jsonl').read_bytes()==(source/'repair/data/all.jsonl').read_bytes()
+ assert len((job/'repair/data/all.jsonl').read_text().splitlines())==48
+
+def test_misnamed_manifest_fails_before_missing_inputs_are_ignored(tmp_path):
+ source,job=task(tmp_path,{'repair/probe.py.dependencies.json':json.dumps({'files':['repair/data/all.jsonl']}),'repair/data/all.jsonl':'{"id":1}\n'})
+ with pytest.raises(ValueError,match=r'misnamed.*probe.dependencies.json'):stage(source,job)
+ assert not (job/'repair/data/all.jsonl').exists()

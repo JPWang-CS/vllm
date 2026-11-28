@@ -55,6 +55,8 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 
 模型、任务目录、端口和输出目录必须分别分配并记录；不同任务不得复用同一可写输出或运行资源。源码/依赖上传使用原子 staging，未完成的副本不能进入启动流程。
 
+跨机作业使用 `repair/worker.dependencies.json` 为 `repair/worker.py` 声明非代码输入，或使用 `repair/staging-manifest.json`。清单名不带 `.py`，内容为 `{"files":["repair/data/config.json","repair/data/all.jsonl"]}`。启动前检查实际作业的 `staging-dependencies.json`：配置、评测数据、两端环境和设备映射证据均已列出并验证。先在实际作业目录完成 CPU prepare，再启动设备阶段；本地清单检查不能代替远端文件到位检查。
+
 物理设备 lease 必须先于 fresh health/mapping 查询取得，并一直持有到 workload 结束和 cleanup 完成。遇到 `lease_busy` 时记录为 `device_resource_gate`、`workload_execution=not_started`；等待当前项目持有者释放或改选其他确认空闲设备，不删除锁文件、不 kill 持有者，也不把它算作模型执行失败。
 
 计算 workload 可以并行；cold launcher 的启动握手必须串行。每个任务先确认自己的 proxy 已真实存活或绑定归属，再允许下一个 launcher 启动；确认后，模型/评测等业务阶段才可按任务合同并行。driver 返回、入队或 `SUBMITTED` 本身都不代表 proxy 已就绪。

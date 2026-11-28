@@ -220,7 +220,14 @@ def stage_declared_repair_dependencies(source, target, source_root, job, script,
     absent declarations preserve the existing script-only staging contract.
     """
     import stat
-    manifests=['repair/staging-manifest.json',str(PurePosixPath(script).with_suffix('.dependencies.json'))]
+    canonical=str(PurePosixPath(script).with_suffix('.dependencies.json'))
+    mistyped=script+'.dependencies.json'
+    try:source.lstat(source_root+'/'+canonical)
+    except FileNotFoundError:
+        try:source.lstat(source_root+'/'+mistyped)
+        except FileNotFoundError:pass
+        else:raise ValueError('misnamed dependency manifest: '+mistyped+'; use '+canonical)
+    manifests=['repair/staging-manifest.json',canonical]
     declared=set()
     for rel in manifests:
         try:attrs=source.lstat(source_root+'/'+rel)
@@ -262,7 +269,7 @@ def stage_declared_repair_dependencies(source, target, source_root, job, script,
 
 def framework_source_file_allowed(name, size):
     """Include model manifests/templates while excluding machine-local config."""
-    return (PurePosixPath(name).suffix in FRAMEWORK_SOURCE_SUFFIXES
+    return (PurePosixPath(name).suffix in FRAMEWORK_SOURCE_SUFFIXES | {'.jsonl'}
             and '.local.' not in name and size <= 2_000_000)
 
 
