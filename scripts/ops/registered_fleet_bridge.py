@@ -34,6 +34,10 @@ FRAMEWORK_SOURCE_RECEIPT = ".runtime/framework-source.json"
 FRAMEWORK_SOURCE_RECEIPT_SCHEMA = 1
 
 
+class TargetProjectBusy(RuntimeError):
+    """A run was deferred before its job directory or workload was created."""
+
+
 def published_source_file_allowed(relative):
     path = PurePosixPath(relative)
     roots = set(FRAMEWORK_SOURCE_ROOTS) | {'docs', 'tests', 'examples'}
@@ -145,6 +149,35 @@ def remote_regular_source(remote, root, relative):
         if not expected(attrs.st_mode):
             raise ValueError("source contains a symlink or nonregular component: " + relative)
     return attrs
+
+
+def compare_active_target_source(source, source_root, target, target_root, files):
+    """Verify identical published files without changing an active target."""
+    records, mismatches = [], []
+    for relative in files:
+        path = PurePosixPath(relative)
+        if path.is_absolute() or '..' in path.parts or not published_source_file_allowed(relative):
+            raise ValueError('invalid published source path')
+        remote_regular_source(source, source_root, relative)
+        with source.open(source_root+'/'+relative,'rb') as stream:
+            expected = stream.read(2_000_001)
+        if len(expected)>2_000_000:
+            raise ValueError('published source exceeds transfer limit')
+        try:
+            remote_regular_source(target,target_root,relative)
+            with target.open(target_root+'/'+relative,'rb') as stream:
+                actual = stream.read(len(expected)+1)
+        except FileNotFoundError:
+            mismatches.append({'path':relative,'reason':'missing'})
+            continue
+        if actual != expected:
+            mismatches.append({'path':relative,'reason':'different content'})
+        else:
+            records.append({'path':relative,'source_path':source_root+'/'+relative,
+                'target_path':target_root+'/'+relative,'bytes':len(expected),
+                'changed':False,'backup_path':None,'write_performed':False})
+    return {'matches':not mismatches,'files_checked':len(files),
+            'files':records,'mismatches':mismatches}
 
 
 def compare_control_to_snapshot(remote, project_root, receipt):
@@ -778,7 +811,7 @@ class Broker:
             client, shlex.join(["docker", "exec", "-i", container, "python3", "-B", "-c", code, root]),
             timeout=45))
         if result.get("busy"):
-            raise RuntimeError(
+            raise TargetProjectBusy(
                 "target project has an active run; refusing framework hot update: "
                 + json.dumps(result.get("active", [])[:8]))
         return result
@@ -952,8 +985,20 @@ print(json.dumps(o,ensure_ascii=False))
             check = "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True,exist_ok=True); assert str(p.resolve())==str(p), 'project symlink outside registered root'"
             self.call(client, shlex.join(["python3", "-B", "-c", check, root]))
             self.call(client, shlex.join(["docker", "exec", con, "test", "-d", root]))
+            active_source = None
             if value["action"] == "run" and value["host"] != self.control_host:
-                self._target_has_active_workload(client, root, con)
+                try:
+                    self._target_has_active_workload(client, root, con)
+                except TargetProjectBusy as exc:
+                    check_sf = client.open_sftp()
+                    try:
+                        active_source = compare_active_target_source(
+                            source,self.project,check_sf,root,source_receipt['files'])
+                    finally:
+                        check_sf.close()
+                    if not active_source['matches']:
+                        raise TargetProjectBusy(str(exc)+'; published source update is pending: '
+                            +json.dumps(active_source['mismatches'][:8])) from exc
             sf = client.open_sftp()
             try:
                 try:
@@ -1005,7 +1050,7 @@ print(json.dumps(o,ensure_ascii=False))
                     "excluded_directories": sorted(PROJECT_COPY_SKIP_DIRS),
                     "files": [],
                 }
-                if value["host"] != self.control_host:
+                if value["host"] != self.control_host and active_source is None:
                     import stat
                     for rel in source_receipt["files"]:
                         # Source content has just been checked against the published
@@ -1053,6 +1098,10 @@ print(json.dumps(o,ensure_ascii=False))
                             if actual.read(len(data) + 1) != data:
                                 raise RuntimeError("target source failed content verification: " + rel)
                     framework_sync["status"] = "verified"
+                elif active_source is not None:
+                    framework_sync.update(status='verified',mode='reuse_identical_active',
+                        files=active_source['files'],source_writes_performed=False,
+                        target_files_checked=active_source['files_checked'])
                 else:
                     framework_sync["status"] = "control_project_already_current"
                 self.atomic(sf, job + "/framework-sync.json", framework_sync)
@@ -1112,6 +1161,16 @@ print(json.dumps(o,ensure_ascii=False))
                     continue
                 except FileNotFoundError:
                     pass
+                waiting_path = str(self.run/'fleet'/('waiting-'+name))
+                waiting = None
+                try:
+                    with sf.open(waiting_path,'rb') as stream:
+                        waiting = json.loads(stream.read())
+                except (FileNotFoundError,ValueError):
+                    pass
+                if (isinstance(waiting,dict) and waiting.get('status')=='WAITING_TARGET_PROJECT'
+                        and waiting.get('retry_at',0)>time.time()):
+                    continue
                 with sf.open(requests + "/" + name, "rb") as f:
                     raw = f.read(131073)
                 if len(raw) > 131072:
@@ -1122,10 +1181,25 @@ print(json.dumps(o,ensure_ascii=False))
                         if request.get("request_id") != name[:-5]:
                             raise ValueError("request filename differs from request_id")
                         result = self.execute(request, sf)
+                    except TargetProjectBusy as exc:
+                        now = time.time()
+                        record = {'status':'WAITING_TARGET_PROJECT','request_id':name[:-5],
+                            'host':request.get('host'),'job':request.get('job'),
+                            'workload_started':False,'job_created':False,
+                            'first_seen':waiting.get('first_seen',now) if isinstance(waiting,dict) else now,
+                            'last_seen':now,'retry_at':now+30,
+                            'wait_count':waiting.get('wait_count',0)+1 if isinstance(waiting,dict) else 1,
+                            'detail':str(exc)[:2500]}
+                        self.atomic(sf,waiting_path,record)
+                        (self.local/('waiting-'+name)).write_text(json.dumps(record,ensure_ascii=False),encoding='utf8')
+                        continue
                     except Exception as exc:
                         result = {"error": type(exc).__name__, "detail": str(exc)[:2500]}
                 result["broker_checked_at"] = time.time()
                 self.atomic(sf, responses + "/" + name, result)
+                if isinstance(waiting,dict):
+                    waiting.update(status='RELEASED',released_at=time.time())
+                    self.atomic(sf,waiting_path,waiting)
                 (self.local / name).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
                 count += 1
         finally:

@@ -27,6 +27,12 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 
 - GLM 查询 fleet job 默认显式使用 `--compact`，完整 response 通过绝对 `response_path` 读取；compact 没有 `response` 外层。先看 `job_outcome` 与文件完整性，缺结果保持 `unknown`/未完成，不盲取 `result.json` 或猜相对路径。
 
+- 提交、远端创建与业务完成分三步核对：`fleet-submit` 的 `submitted_to_broker_queue` 表示请求已保存；该请求的响应中 `submitted=true` 表示远端作业已创建；再通过 `fleet-job-status` 读取执行结果。等待前两步时保留同一请求，续接先比对 host、job、script、devices、args，再接回原请求。完整状态文件中的退出码为 `state.json.exit`；使用 `job_outcome` 或解析 JSON，不根据截断文本猜测结束条件。
+
+- CPU 准备使用最终启动参数，包括尝试编号与角色后缀。Ray 路径交给当前适配器检查完整名称、项目归属和 socket 长度。检查计划、依赖、环境、设备映射与评测合同齐全后再放行；`CPU_PREPARED` 或 exit0 本身不代表计划可启动。
+
+- 目标项目正在运行且需要更新源码时，broker 保留原请求，以 `fleet/waiting-<request>.json` 的 `WAITING_TARGET_PROJECT` 状态继续检查，不返回部署失败、不加载模型、不重复提交。若目标发布文件逐文件内容一致，broker 只读核对并复用它们，将新脚本、输入和结果写到各自作业目录；`framework-sync.json` 记录 `reuse_identical_active` 和未写源码的证据。未知错误仍按失败处理。
+
 - 新任务指示写入 `OPERATOR_UPDATE.json` 后，核当前执行实际 Read 或状态查询的成功工具结果已包含对应更新 id/指示；文件落盘不代表已消费，stop 更新同样必须保留并执行。
 
 - 目标切换而 active 尚未消费时，先核 checkpoint、真实请求与活动 job。无业务启动才按授权核清本 controller 的 owned cleanup，再沿 server-use 3.8.8 正式 `run_task.py --resume` 交短任务；已有业务继续跟原 job，禁止重放、复制 launcher、接连重启或无证据归因超时/API。
@@ -72,7 +78,7 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 - `recover_framework.py` 的 Python 函数调用可用 `devices=[]` 表示无设备任务；CLI 不要写 `--devices []`（`[]` 不是整数，会被 argparse 拒绝）。CPU 诊断照抄：`python3 -B scripts/ops/recover_framework.py --project <project> --task <task> --action fleet-submit --request-id <id> --fleet-action run --host <host> --job <job> --fleet-script repair/<probe>.py --devices --args-json '["--cpu-only"]'`；设备任务写成 `--devices 1 2 ...`；省略整个 `--devices` 必须在写队列前失败。请求文件采用任务目录内的原子写。fleet runner 会在设备任务执行前检查健康和空闲，broker 会检查 protected devices；业务状态读取与 controller/broker 心跳分离。
 - 真实模型类导入、映射与健康/空闲复核、smoke、适用的 P/D KV 检查、48 条精度、profile/timeline、清理核验、阈值记录和 checkpoint 写入仍需执行者按上述顺序完成。质量阈值未指定时记录 `quality_status=not_specified`，不得修改样本或阈值来制造通过。
 
-提交回执不是完成结果：`fleet/responses/<run-request>.json` 中的 `submitted` 只表示 job 已入队；必须另发 status request，再读取该 job 的 `state`、`exit`、`failure` 与结果文件，才能判断阶段结果。Bash 使用管道时启用 `pipefail`，禁止用 `head`、`|| true` 或末端命令的 0 掩盖上游失败；有界输出沿用现有 helper。
+`fleet/responses/<run-request>.json` 中的 `submitted=true` 表示远端作业已创建；必须另发 status request，再读取该 job 的 `state`、`exit`、`failure` 与结果文件，才能判断阶段结果。Bash 使用管道时启用 `pipefail`，禁止用 `head`、`|| true` 或末端命令的 0 掩盖上游失败；有界输出沿用现有 helper。
 
 对 fleet job，优先调用 `recover_framework.py --project <绝对项目根> --task <任务名> --action fleet-job-status --host <登记IP> --job <job> --wait-seconds 15 --compact`。它负责真正的 status 请求、未返回查询的复用和原始结果读取；完整模式 pending 的 `response` 恒为 dict，合法新 schema 的不可变 exited terminal 可复用但不代表新鲜设备状态，每次读取都会刷新 `operator_update`；running、查询错误、未完成和旧 schema 继续发新 status 请求。response_path 读取仍受项目归属、symlink 和大小门保护。不再由 agent 拼多个请求或猜测工作目录。执行成功仅表示进程退出为 0，评测完整性、质量和 profile 继续逐项验收。具体状态与失败读取规则见 `fullnet-debug`。
 
@@ -88,4 +94,4 @@ A3 与 A5 独立验收。`examples/offline/config.yaml` 和 A3/A5 HTTP fixture �
 
 正式验收必须保留首错和逐阶段状态。质量、输出对照、逐层数值检查、服务性能和设备 profile 分开记录；失败时仍导出 task 报告和原始结果，不覆盖旧实验。禁止 NPU 带外 reset、驱动变更和共享环境修改。
 
-新 run 前先同步已发布 main。源码副本须有项目内 `.runtime/framework-source.json` 与实际已发布快照，broker 按内容检查来源并记录目标同步结果。发现旧内存 broker 或活动模型任务时停止新提交，保留已有任务；不同步 CANN、模型权重和私有环境。
+新 run 前先同步已发布 main。源码副本须有项目内 `.runtime/framework-source.json` 与实际已发布快照，broker 按内容检查来源并记录目标同步结果。旧内存 broker 先更新；目标有活动任务时，源码需要更新则等待，源码完全一致则只读复用。保留已有任务，不同步 CANN、模型权重和私有环境。
