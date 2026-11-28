@@ -7,12 +7,15 @@ gated immediately before their script executes inside the personal container.
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import importlib.util
+import io
 import json
 import posixpath
 import re
 import shlex
+import stat
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -32,6 +35,9 @@ FRAMEWORK_SOURCE_SUFFIXES = frozenset({'.py', '.sh', '.md', '.toml', '.json', '.
 FRAMEWORK_SOURCE_ROOTS = ("scripts", "src", "models", ".agents", "requirements")
 FRAMEWORK_SOURCE_RECEIPT = ".runtime/framework-source.json"
 FRAMEWORK_SOURCE_RECEIPT_SCHEMA = 1
+CAPTURE_MAX_FILE_BYTES = 2_000_000
+CAPTURE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+CAPTURE_MAX_RECORDS = 4096
 
 
 class TargetProjectBusy(RuntimeError):
@@ -149,6 +155,130 @@ def remote_regular_source(remote, root, relative):
         if not expected(attrs.st_mode):
             raise ValueError("source contains a symlink or nonregular component: " + relative)
     return attrs
+
+
+class CapturedRemoteAttrs:
+    def __init__(self, mode, size):
+        self.st_mode, self.st_size = mode, size
+
+
+class CapturedRemote:
+    """Read-only SFTP-shaped view backed by one remote capture response."""
+    def __init__(self, payload):
+        if not isinstance(payload, dict) or payload.get("schema") != "fullnet.source-capture.v1":
+            raise ValueError("invalid source capture schema")
+        records = payload.get("records")
+        if not isinstance(records, dict) or len(records) > CAPTURE_MAX_RECORDS:
+            raise ValueError("source capture record limit exceeded")
+        self.records = records
+        self.total_bytes = 0
+        for path, record in records.items():
+            if not isinstance(path, str) or not isinstance(record, dict):
+                raise ValueError("invalid source capture record")
+            if record.get("status") == "present" and record.get("data") is not None:
+                try:
+                    data = base64.b64decode(record["data"], validate=True)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid source capture bytes") from exc
+                if len(data) != record.get("size") or len(data) > CAPTURE_MAX_FILE_BYTES:
+                    raise ValueError("source capture file limit exceeded")
+                self.total_bytes += len(data)
+                if self.total_bytes > CAPTURE_MAX_TOTAL_BYTES:
+                    raise ValueError("source capture total limit exceeded")
+
+    def lstat(self, path):
+        record = self.records.get(str(path))
+        if record is None or record.get("status") == "missing":
+            raise FileNotFoundError(path)
+        if record.get("status") != "present":
+            raise OSError("source capture record is unusable: " + str(path))
+        return CapturedRemoteAttrs(int(record["mode"]), int(record["size"]))
+
+    def open(self, path, mode="rb"):
+        if mode != "rb":
+            raise ValueError("captured source view is read-only")
+        record = self.records.get(str(path))
+        self.lstat(path)
+        if not stat.S_ISREG(int(record["mode"])):
+            raise ValueError("captured source is not a regular file: " + str(path))
+        return io.BytesIO(base64.b64decode(record["data"], validate=True))
+
+
+CAPTURE_SCRIPT = r'''
+import base64,json,os,stat,sys
+MAX_FILE=2000000
+MAX_TOTAL=32*1024*1024
+manifest=json.loads(sys.argv[1])
+if not isinstance(manifest,list) or len(manifest)>4096: raise ValueError('invalid capture manifest')
+records={}; total=0
+def add(path):
+ global total
+ path=os.path.abspath(path)
+ if path in records:return
+ try: attrs=os.lstat(path)
+ except FileNotFoundError:
+  records[path]={'status':'missing'}; return
+ record={'status':'present','mode':attrs.st_mode,'size':attrs.st_size}
+ if stat.S_ISREG(attrs.st_mode):
+  if attrs.st_size>MAX_FILE: raise ValueError('captured file exceeds limit: '+path)
+  flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)
+  fd=os.open(path,flags)
+  try:
+   actual=os.fstat(fd)
+   if not stat.S_ISREG(actual.st_mode) or actual.st_size!=attrs.st_size: raise OSError('source changed during capture: '+path)
+   data=os.read(fd,MAX_FILE+1)
+  finally: os.close(fd)
+  if len(data)>MAX_FILE: raise ValueError('captured file exceeds limit: '+path)
+  total+=len(data)
+  if total>MAX_TOTAL: raise ValueError('captured source total exceeds limit')
+  record['size']=len(data); record['data']=base64.b64encode(data).decode('ascii')
+ records[path]=record
+ if len(records)>4096: raise ValueError('captured source record limit exceeded')
+for item in manifest:
+ if not isinstance(item,dict) or not isinstance(item.get('root'),str) or not isinstance(item.get('files'),list) or not isinstance(item.get('parents',[]),list): raise ValueError('invalid capture root')
+ root=os.path.abspath(item['root'])
+ add(root)
+ for relative in [*item.get('parents',[]),*item['files']]:
+  if not isinstance(relative,str) or os.path.isabs(relative) or '..' in relative.replace('\\','/').split('/'): raise ValueError('unsafe capture relative path')
+  current=root
+  for part in relative.replace('\\','/').split('/'):
+   current=os.path.join(current,part); add(current)
+   if records[current].get('status')=='present' and not stat.S_ISDIR(records[current]['mode']) and current!=os.path.join(root,*relative.replace('\\','/').split('/')): break
+print(json.dumps({'schema':'fullnet.source-capture.v1','records':records},separators=(',',':')))
+'''
+
+
+def capture_manifest(roots):
+    """Validate the allowlisted capture request before remote execution."""
+    if not isinstance(roots, list) or not roots or len(roots) > 4:
+        raise ValueError("invalid source capture roots")
+    result = []
+    for item in roots:
+        if not isinstance(item, dict):
+            raise ValueError("invalid source capture root")
+        root = _absolute_posix_path(item.get("root"), "capture root")
+        files = item.get("files")
+        if not isinstance(files, list) or len(files) > CAPTURE_MAX_RECORDS:
+            raise ValueError("invalid source capture files")
+        safe = []
+        for relative in files:
+            path = PurePosixPath(relative)
+            if (not isinstance(relative, str) or path.is_absolute() or ".." in path.parts
+                    or not published_source_file_allowed(relative)):
+                raise ValueError("invalid published source path")
+            safe.append(relative)
+        result.append({"root": str(root), "files": safe, "parents": []})
+    base = PurePosixPath(result[0]["root"])
+    for item in result[1:]:
+        root = PurePosixPath(item["root"])
+        if not root.is_relative_to(base):
+            raise ValueError("capture roots do not share a registered project root")
+        relative = root.relative_to(base).as_posix()
+        if relative:
+            item_base = result[0]["parents"]
+            parts = relative.split("/")
+            item_base.extend("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+    return result
 
 
 def compare_active_target_source(source, source_root, target, target_root, files, progress=None):
@@ -830,7 +960,14 @@ class Broker:
             raise RuntimeError("broker source changed on disk; restart broker before a new run")
         files = receipt.get("files") if isinstance(receipt, dict) else None
         validated = validate_framework_receipt(receipt, files or [])
-        comparison = compare_control_to_snapshot(source, self.project, validated,
+        verified_source_view = self._capture_remote_view(
+            self.control,
+            [{"root": self.project, "files": validated["files"]},
+             {"root": validated["snapshot"], "files": validated["files"]}],
+            heartbeat_source=source,
+        )
+        self.verified_source_view = verified_source_view
+        comparison = compare_control_to_snapshot(verified_source_view or source, self.project, validated,
                                                  lambda:self.heartbeat(source))
         if not comparison["matches"]:
             raise RuntimeError(
@@ -857,6 +994,23 @@ class Broker:
         if rc:
             raise RuntimeError(f"remote command exit {rc}: {err[-1500:]} {out[-1000:]}")
         return out
+
+    def _capture_remote_view(self, client, roots, heartbeat_source=None):
+        """Capture allowlisted read-only source bytes in one remote exec."""
+        if not callable(getattr(client, "exec_command", None)):
+            return None
+        manifest = capture_manifest(roots)
+        command = shlex.join([
+            "python3", "-B", "-c", CAPTURE_SCRIPT,
+            json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+        ])
+        if heartbeat_source is not None:
+            self.heartbeat(heartbeat_source)
+        raw_output = self.call(client, command, timeout=120)
+        if heartbeat_source is not None:
+            self.heartbeat(heartbeat_source)
+        raw = json.loads(raw_output)
+        return CapturedRemote(raw)
 
     def atomic(self, sftp, name, value):
         temp = name + ".tmp"
@@ -914,6 +1068,7 @@ class Broker:
 
     def execute(self, request, source):
         value = validate_request(request, self.targets)
+        self.verified_source_view = None
         target = self.targets[value["host"]]
         root, management, con = target["project"], target["management"], target["container"]
         if set(value.get("devices", [])) & set(target.get("protected_devices", [])):
@@ -923,6 +1078,7 @@ class Broker:
         if value["action"] == "run":
             source_receipt = self._read_source_receipt(source)
             source_receipt, source_comparison = self._check_published_source(source, source_receipt)
+        verified_source_view = self.verified_source_view
         client = self.helper.connect(target.get("ssh_alias", value["host"]))
         try:
             job = str(PurePosixPath(root) / "runs" / self.task / "fleet-jobs" / value.get("job", value["request_id"]))
@@ -1094,13 +1250,21 @@ print(json.dumps(o,ensure_ascii=False))
                 try:
                     target_workload = self._target_has_active_workload(client, root, con)
                 except TargetProjectBusy as exc:
-                    check_sf = client.open_sftp()
-                    try:
+                    target_view = self._capture_remote_view(
+                        client, [{"root": root, "files": source_receipt["files"]}],
+                        heartbeat_source=source)
+                    if target_view is not None:
                         active_source = compare_active_target_source(
-                            source,self.project,check_sf,root,source_receipt['files'],
-                            lambda:self.heartbeat(source))
-                    finally:
-                        check_sf.close()
+                            verified_source_view or source, self.project, target_view, root,
+                            source_receipt['files'], lambda:self.heartbeat(source))
+                    else:
+                        check_sf = client.open_sftp()
+                        try:
+                            active_source = compare_active_target_source(
+                                source,self.project,check_sf,root,source_receipt['files'],
+                                lambda:self.heartbeat(source))
+                        finally:
+                            check_sf.close()
                     try:
                         reused_source, reused_source_mode = target_source_reuse_decision(
                             active_source, True, str(exc))
@@ -1110,13 +1274,21 @@ print(json.dumps(o,ensure_ascii=False))
                     # An idle target is safe to inspect before creating the job.
                     # Reuse is read-only; mismatches deliberately fall through to
                     # the existing synchronization path below.
-                    check_sf = client.open_sftp()
-                    try:
+                    target_view = self._capture_remote_view(
+                        client, [{"root": root, "files": source_receipt["files"]}],
+                        heartbeat_source=source)
+                    if target_view is not None:
                         idle_source = compare_active_target_source(
-                            source,self.project,check_sf,root,source_receipt['files'],
-                            lambda:self.heartbeat(source))
-                    finally:
-                        check_sf.close()
+                            verified_source_view or source, self.project, target_view, root,
+                            source_receipt['files'], lambda:self.heartbeat(source))
+                    else:
+                        check_sf = client.open_sftp()
+                        try:
+                            idle_source = compare_active_target_source(
+                                source,self.project,check_sf,root,source_receipt['files'],
+                                lambda:self.heartbeat(source))
+                        finally:
+                            check_sf.close()
                     reused_source, reused_source_mode = target_source_reuse_decision(
                         idle_source, False)
             sf = client.open_sftp()
