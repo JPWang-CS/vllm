@@ -87,6 +87,8 @@ GLM 或任务脚本的起始 `cwd` 可能是 controller/task 目录，不要把�
 对 fleet job，优先调用 `recover_framework.py --project <绝对项目根> --task <任务名> --action fleet-job-status --host <登记IP> --job <job> --wait-seconds 15 --compact`。它负责真正的 status 请求、未返回查询的复用和原始结果读取；完整模式 pending 的 `response` 恒为 dict，合法新 schema 的不可变 exited terminal 可复用但不代表新鲜设备状态，每次读取都会刷新 `operator_update`；running、查询错误、未完成和旧 schema 继续发新 status 请求。response_path 读取仍受项目归属、symlink 和大小门保护。不再由 agent 拼多个请求或猜测工作目录。执行成功仅表示进程退出为 0，评测完整性、质量和 profile 继续逐项验收。具体状态与失败读取规则见 `fullnet-debug`。
 
 每个 `result.json`、`validation.json` 独立保存完整 JSON，不能切成字符片段。runner 在子进程 exit0 后执行结构检查；不合法的结果会使 job 失败。设备门未通过、workload 未开始时选择其他健康空闲资源，继续保留该次检查结果，不重复使用旧卡号等待。
+- worker 预执行已占卡但 workload 未开始时，只有当前 job 的完整未截断证据、head 未加载模型且两端 cleanup 已核验，才可回原队列；缺任一项按失败关闭。
+- 完整 `plan.json` 从 fleet 的完整 response 读取，不在 control 本机 `ls` 远端 `/data2`；执行角色按当前 job 最终参数重建 job-local plan，不复用旧的 CPU prepare 路径。
 
 fleet 接口结果边界：`fleet-submit` 回执必须保留 `business_run` 和绝对 `response_path`；`fleet-status` 的 `job_outcome` 按实际证据区分 `submitted_not_validated`、`running`、`failed`、`succeeded`、`unknown` 或 `broker_failed`，`business_acceptance` 始终为 `NOT_VALIDATED`，直到独立完成精度/profile 验收。Bash 的 `cwd` 会保留 `cd` 变化，任务路径优先使用绝对路径，不要在已有绝对 cwd 下重复拼相对 `cd`。broker 连接使用登记 alias；认证失败先核对实际入口，不改密码。正常 `MODEL_COMPLETED` 不归类为 API 失败。
 

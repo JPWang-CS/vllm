@@ -880,14 +880,14 @@ sys.exit(code)
 
 
 STATUS_READER = r'''
-import json,pathlib,sys
+import json,pathlib,re,sys
 JSON_LIMIT=256*1024
 LOG_LIMIT=14000
-JSON_FILES={'state.json','process.json','failure.json','result.json','validation.json'}
+JSON_FILES={'state.json','process.json','failure.json','result.json','validation.json','plan.json'}
 j=pathlib.Path(sys.argv[1]).resolve(strict=True);r=pathlib.Path(sys.argv[2]).resolve(strict=True)
 if not j.is_relative_to(r/'runs'/sys.argv[3]/'fleet-jobs'):raise ValueError('job outside task')
 if sys.argv[4]=='cancel':(j/'CANCEL').touch(exist_ok=True)
-o={'job':str(j),'file_metadata':{}}
+o={'job':str(j),'file_metadata':{},'file_presence':{}}
 def safe_file(name):
  p=j/name
  if p.is_symlink():
@@ -918,12 +918,22 @@ def log_value(p):
   raw=stream.read(LOG_LIMIT)
  return raw.decode('utf-8',errors='replace'),{'path':str(p),'original_bytes':size,
          'truncated':start>0,'snippet_start_byte':start,'limit_bytes':LOG_LIMIT}
-for n in ['state.json','process.json','failure.json','exit.txt','workload.log','runner.log','result.json','validation.json','report.md']:
+for n in ['state.json','process.json','failure.json','exit.txt','workload.log','runner.log','plan.json','result.json','validation.json','report.md']:
  p=safe_file(n)
+ if n in {'process.json','workload.log'}:o['file_presence'][n]=p is not None
  if p is not None:
   value,metadata=json_value(p) if n in JSON_FILES else log_value(p)
   o[n]=value
   o['file_metadata'][n]=metadata
+for p in sorted(j.glob('device-*-post.txt')):
+ if not re.fullmatch(r'device-\d+-post\.txt',p.name):continue
+ name=p.name
+ safe=safe_file(name)
+ if safe is None:continue
+ value,metadata=log_value(safe)
+ o[name]=value
+ o['file_metadata'][name]=metadata
+ o['file_presence'][name]=True
 print(json.dumps(o,ensure_ascii=False))
 '''
 
