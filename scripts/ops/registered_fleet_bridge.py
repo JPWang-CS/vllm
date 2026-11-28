@@ -492,6 +492,27 @@ def process_table_empty(text):
     return bool(re.search(r"No process in device|No running processes found in NPU", text, re.IGNORECASE))
 
 
+def canonical_inventory_result(raw):
+    """Use only the target-container query as the inventory source of truth."""
+    if not isinstance(raw, dict):
+        raise RuntimeError("inventory probe did not return an object")
+    container = raw.get("container_query")
+    if not isinstance(container, dict) or container.get("exit") != 0:
+        raise RuntimeError("container inventory query failed; host evidence is diagnostic only")
+    for field in ("mapping", "devices"):
+        value = container.get(field)
+        if not isinstance(value, dict) or value.get("exit") != 0:
+            raise RuntimeError(
+                f"container inventory {field} query failed; host evidence is diagnostic only"
+            )
+    result = dict(raw)
+    result["mapping"] = container["mapping"]
+    result["devices"] = container["devices"]
+    result["execution_surface"] = "container"
+    result["tool"] = raw.get("container_tool")
+    return result
+
+
 def validate_request(value, targets):
     if set(value) - {"request_id", "action", "host", "job", "script", "devices", "args", "asset", "framework_source"}:
         raise ValueError("unexpected fleet request fields")
@@ -982,19 +1003,73 @@ class Broker:
                 return {"asset":asset,"transferred_bytes":transferred,"files":len(listing["files"]),"target":root+"/assets/weights/"+asset,"acceptance":"files_transferred_model_not_validated"}
             if value["action"] == "inventory":
                 code = r'''
-import json,pathlib,subprocess,sys
-m=pathlib.Path(sys.argv[1]);r=pathlib.Path(sys.argv[2]);o={'management':str(m),'project':str(r),'project_exists':r.exists(),'project_realpath':str(r.resolve()),'container':sys.argv[3]}
+import json,os,pathlib,shutil,stat,subprocess,sys
+m=pathlib.Path(sys.argv[1]);r=pathlib.Path(sys.argv[2]);con=sys.argv[3];request_id=sys.argv[4]
+o={'management':str(m),'project':str(r),'project_exists':r.exists(),'project_realpath':str(r.resolve()),'container':con}
 def call(args):
  try:
-  p=subprocess.run(args,capture_output=True,text=True,timeout=20);return {'exit':p.returncode,'stdout':p.stdout[-16000:],'stderr':p.stderr[-1500:]}
+  p=subprocess.run(args,capture_output=True,text=True,timeout=60);return {'exit':p.returncode,'stdout':p.stdout[-16000:],'stderr':p.stderr[-1500:]}
  except Exception as e:return {'error':type(e).__name__,'detail':str(e)}
-o['container_info']=call(['docker','inspect','--format','{{json .Mounts}}',sys.argv[3]])
-for label,args in [('mapping',[str(m/'tools/bin/npu-smi'),'info','-m']),('devices',[str(m/'tools/bin/npu-smi'),'info']),('addresses',['ip','-br','address']),('routes',['ip','route'])]:o[label]=call(args)
+o['container_info']=call(['docker','inspect','--format','{{json .Mounts}}',con])
+management_tool=m/'tools/bin/npu-smi'
+o['host_raw']={'tool':{'path':str(management_tool),'execution_surface':'host','query':'not_run'}}
+for label,args in [('addresses',['ip','-br','address']),('routes',['ip','route'])]:o[label]=call(args)
+
+project_arg=r
+root=project_arg.resolve(strict=True)
+if not project_arg.is_absolute() or str(root)!=str(project_arg) or not root.is_dir():raise RuntimeError('project root is not a canonical directory')
+runtime=root/'.runtime';device_query=runtime/'device-query'/request_id
+for directory in (runtime,runtime/'device-query',device_query):
+ if directory.is_symlink() or (directory.exists() and not directory.is_dir()):raise RuntimeError('device-query path is not a real directory')
+ directory.mkdir(parents=True,exist_ok=True)
+ if directory.is_symlink() or not directory.resolve(strict=True).is_relative_to(root):raise RuntimeError('device-query path escapes project')
+source_tool=None
+for candidate in (pathlib.Path('/usr/local/sbin/npu-smi'),pathlib.Path('/usr/local/bin/npu-smi')):
+ try:
+  mode=candidate.stat().st_mode
+  if candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size>4096 and mode&0o111:
+   source_tool=candidate;break
+ except OSError:pass
+if source_tool is None:raise RuntimeError('runner host-matched npu-smi ELF is unavailable')
+with source_tool.open('rb') as inp:
+ if inp.read(4)!=b'\x7fELF':raise RuntimeError('runner host-matched npu-smi is not an ELF')
+staged=device_query/'npu-smi'
+if staged.exists() or staged.is_symlink():raise RuntimeError('inventory staged npu-smi already exists')
+flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+if hasattr(os,'O_NOFOLLOW'):flags|=os.O_NOFOLLOW
+fd=os.open(str(staged),flags,0o500)
+try:
+ with os.fdopen(fd,'wb') as out, source_tool.open('rb') as inp:shutil.copyfileobj(inp,out)
+finally:
+ try:os.chmod(staged,0o555)
+ except OSError:pass
+if staged.is_symlink() or not staged.resolve(strict=True).is_relative_to(root):raise RuntimeError('staged npu-smi escapes project')
+container_probe=r"""import json,os,pathlib,subprocess,sys
+root=pathlib.Path(sys.argv[1]);tool=pathlib.Path(sys.argv[2])
+if not root.is_dir() or str(root.resolve(strict=True))!=str(root):raise RuntimeError('mounted project path is not canonical')
+if tool.is_symlink() or not tool.is_file() or not tool.resolve(strict=True).is_relative_to(root):raise RuntimeError('container tool is outside mounted project')
+env=dict(os.environ);env['LD_LIBRARY_PATH']='/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common'+((':'+env['LD_LIBRARY_PATH']) if env.get('LD_LIBRARY_PATH') else '')
+env.pop('ASCEND_RT_VISIBLE_DEVICES',None);env.pop('ASCEND_VISIBLE_DEVICES',None)
+def query(args):
+ try:
+  p=subprocess.run([str(tool),*args],capture_output=True,text=True,timeout=20,env=env)
+  return {'exit':p.returncode,'stdout':p.stdout[-16000:],'stderr':p.stderr[-1500:]}
+ except Exception as e:return {'error':type(e).__name__,'detail':str(e)}
+print(json.dumps({'mapping':query(['info','-m']),'devices':query(['info']),'tool':{'path':str(tool),'realpath':str(tool.resolve(strict=True)),'execution_surface':'container','ld_library_path':env.get('LD_LIBRARY_PATH')}}))"""
+probe=call(['docker','exec','--user','0','-i','-w',str(root),con,'python3','-B','-c',container_probe,str(root),str(staged)])
+if probe.get('exit')==0:
+ try:
+  o['container_query']=json.loads(probe.get('stdout',''))
+  o['container_query']['exit']=0
+ except (TypeError,ValueError):o['container_query']={'exit':1,'stdout':probe.get('stdout',''),'stderr':probe.get('stderr',''),'error':'invalid container probe JSON'}
+else:o['container_query']=probe
+o['container_tool']={'path':str(staged),'realpath':str(staged.resolve(strict=True)),'execution_surface':'container','source':str(source_tool)}
 for label,base in [('model_runtime',m.parents[1]/'pangu-deploy'),('project_runtime',r/'envs'),('weights',r/'assets/weights')]:
  o[label]={'path':str(base),'exists':base.exists(),'entries':sorted(x.name for x in base.iterdir())[:40] if base.is_dir() else []}
 print(json.dumps(o,ensure_ascii=False))
 '''
-                return json.loads(self.call(client, shlex.join(["python3", "-B", "-", management, root, con]), code, 100))
+                raw = json.loads(self.call(client, shlex.join(["python3", "-B", "-", management, root, con, value["request_id"]]), code, 180))
+                return canonical_inventory_result(raw)
             if value["action"] in {"status", "cancel"}:
                 code = STATUS_READER
                 return json.loads(self.call(client, shlex.join(["docker", "exec", "-i", "--user", "0", con, "python3", "-B", "-", job, root, self.task, value["action"]]), code))
